@@ -18,8 +18,8 @@ enum ResponsesPayloadParser {
     }
 
     static func parseResponse(jsonObject: Any) -> ParsedResponsePayload {
-        let outputText = joinedUnique(stringsFromOutput(in: jsonObject))
-        let thoughts = normalize(joinedUnique(stringsFromReasoning(in: jsonObject)))
+        let outputText = joinedWithoutConsecutiveDuplicates(stringsFromOutput(in: jsonObject))
+        let thoughts = normalize(joinedWithoutConsecutiveDuplicates(stringsFromReasoning(in: jsonObject)))
         return ParsedResponsePayload(outputText: outputText, thoughts: thoughts)
     }
 
@@ -35,32 +35,32 @@ enum ResponsesPayloadParser {
         }
 
         if loweredEvent.contains("reasoning") || loweredEvent.contains("thinking") {
-            joinedUnique(deltaStrings(in: json, preferReasoning: true))
+            joinedWithoutConsecutiveDuplicates(deltaStrings(in: json, preferReasoning: true))
                 .nonEmpty
                 .map { events.append(.thoughtsDelta($0)) }
             return events
         }
 
         if loweredEvent.contains("output_text") || loweredEvent.contains("message") || loweredEvent.contains("content") {
-            joinedUnique(deltaStrings(in: json, preferReasoning: false))
+            joinedWithoutConsecutiveDuplicates(deltaStrings(in: json, preferReasoning: false))
                 .nonEmpty
                 .map { events.append(.outputDelta($0)) }
             return events
         }
 
         if let type = nestedTypeMarker(in: json), type.contains("reasoning") {
-            joinedUnique(deltaStrings(in: json, preferReasoning: true))
+            joinedWithoutConsecutiveDuplicates(deltaStrings(in: json, preferReasoning: true))
                 .nonEmpty
                 .map { events.append(.thoughtsDelta($0)) }
         } else if let type = nestedTypeMarker(in: json), type.contains("message") || type.contains("output_text") {
-            joinedUnique(deltaStrings(in: json, preferReasoning: false))
+            joinedWithoutConsecutiveDuplicates(deltaStrings(in: json, preferReasoning: false))
                 .nonEmpty
                 .map { events.append(.outputDelta($0)) }
         } else {
-            joinedUnique(deltaStrings(in: json, preferReasoning: true))
+            joinedWithoutConsecutiveDuplicates(deltaStrings(in: json, preferReasoning: true))
                 .nonEmpty
                 .map { events.append(.thoughtsDelta($0)) }
-            joinedUnique(deltaStrings(in: json, preferReasoning: false))
+            joinedWithoutConsecutiveDuplicates(deltaStrings(in: json, preferReasoning: false))
                 .nonEmpty
                 .map { events.append(.outputDelta($0)) }
         }
@@ -185,11 +185,15 @@ enum ResponsesPayloadParser {
         return nil
     }
 
-    private static func joinedUnique(_ strings: [String]) -> String {
-        var seen = Set<String>()
+    private static func joinedWithoutConsecutiveDuplicates(_ strings: [String]) -> String {
+        var previous: String?
         return strings
             .filter { !$0.isEmpty }
-            .filter { seen.insert($0).inserted }
+            .filter {
+                let shouldKeep = $0 != previous
+                previous = $0
+                return shouldKeep
+            }
             .joined()
     }
 
