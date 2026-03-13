@@ -8,17 +8,17 @@ struct ThoughtsDisclosureView: View {
 
     var body: some View {
         DisclosureGroup(isExpanded: $isExpanded) {
-            MarkdownTextView(markdown: thoughts)
+            MarkdownTextView(markdown: thoughts, style: .subdued)
                 .padding(.top, 8)
         } label: {
-            Label("Thoughts", systemImage: "brain.head.profile")
-                .font(.system(size: 12, weight: .semibold))
-                .foregroundStyle(.secondary)
+            Text("Reasoning")
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(Color.secondary.opacity(0.78))
         }
         .padding(12)
         .background(
             RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .fill(Color.gray.opacity(0.08))
+                .fill(Color.gray.opacity(0.06))
         )
         .onAppear {
             isExpanded = startsExpanded

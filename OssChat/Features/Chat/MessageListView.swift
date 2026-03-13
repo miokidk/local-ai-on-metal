@@ -23,17 +23,25 @@ struct MessageListView: View {
     var body: some View {
         ScrollViewReader { proxy in
             ScrollView {
-                LazyVStack(spacing: 18) {
+                LazyVStack(spacing: 24) {
                     ForEach(Array(conversation.messages.enumerated()), id: \.element.id) { index, message in
                         MessageBubbleView(
                             message: message,
                             isLastAssistantMessage: index == conversation.messages.indices.last && message.role == .assistant,
                             autoShowThoughts: autoShowThoughts,
                             onCopy: {
-                                let combined = [message.thoughts, message.content]
-                                    .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
-                                    .filter { !$0.isEmpty }
-                                    .joined(separator: "\n\n")
+                                var segments: [String] = []
+
+                                if let thoughts = message.thoughts?.trimmingCharacters(in: .whitespacesAndNewlines), !thoughts.isEmpty {
+                                    segments.append(thoughts)
+                                }
+
+                                if !message.trimmedContent.isEmpty {
+                                    segments.append(message.content)
+                                }
+
+                                segments.append(contentsOf: message.attachments.map(\.modelInputText))
+                                let combined = segments.joined(separator: "\n\n")
                                 onCopy(combined)
                             },
                             onRegenerate: onRegenerate
@@ -44,8 +52,8 @@ struct MessageListView: View {
                         .frame(height: 1)
                         .id("message-bottom")
                 }
-                .padding(.horizontal, 28)
-                .padding(.vertical, 24)
+                .padding(.horizontal, 24)
+                .padding(.vertical, 32)
                 .background(
                     ScrollViewOffsetObserver { isNearBottom in
                         userIsNearBottom = isNearBottom
@@ -53,7 +61,7 @@ struct MessageListView: View {
                     .frame(width: 0, height: 0)
                 )
             }
-            .background(Color(nsColor: .underPageBackgroundColor))
+            .background(Color(nsColor: .windowBackgroundColor))
             .onAppear {
                 scrollToBottom(proxy, animated: false)
             }
@@ -93,13 +101,13 @@ private struct MessageBubbleView: View {
     var body: some View {
         VStack(alignment: message.role == .user ? .trailing : .leading, spacing: 8) {
             HStack {
-                if message.role == .user { Spacer(minLength: 80) }
+                if message.role == .user { Spacer(minLength: 120) }
 
                 VStack(alignment: .leading, spacing: 10) {
                     if let thoughts = message.thoughts?.trimmingCharacters(in: .whitespacesAndNewlines), !thoughts.isEmpty {
                         ThoughtsDisclosureView(
                             thoughts: thoughts,
-                            startsExpanded: autoShowThoughts || message.state == .streaming
+                            startsExpanded: autoShowThoughts
                         )
                     }
 
@@ -109,6 +117,10 @@ private struct MessageBubbleView: View {
                         Text("Thinking…")
                             .font(.system(size: 14))
                             .foregroundStyle(.secondary)
+                    }
+
+                    if !message.attachments.isEmpty {
+                        AttachmentListView(attachments: message.attachments)
                     }
 
                     if let errorText = message.errorText {
@@ -140,7 +152,7 @@ private struct MessageBubbleView: View {
                 }
                 .onHover { isHovering = $0 }
 
-                if message.role == .assistant { Spacer(minLength: 80) }
+                if message.role == .assistant { Spacer(minLength: 120) }
             }
 
             Text(message.createdAt.formatted(date: .omitted, time: .shortened))
@@ -161,10 +173,15 @@ private struct MessageBubbleView: View {
         }
     }
 
+    @ViewBuilder
     private var bubbleBackground: some View {
-        RoundedRectangle(cornerRadius: 22, style: .continuous)
-            .fill(message.role == .user ? Color.accentColor.opacity(0.10) : Color.white.opacity(0.9))
-            .shadow(color: Color.black.opacity(message.role == .user ? 0.015 : 0.04), radius: 12, y: 8)
+        if message.role == .user {
+            RoundedRectangle(cornerRadius: 22, style: .continuous)
+                .fill(Color(nsColor: .controlBackgroundColor))
+        } else {
+            RoundedRectangle(cornerRadius: 22, style: .continuous)
+                .fill(Color.clear)
+        }
     }
 }
 
@@ -178,8 +195,39 @@ private struct BubbleActionButton: View {
                 .font(.system(size: 11, weight: .semibold))
                 .foregroundStyle(.secondary)
                 .frame(width: 26, height: 26)
-                .background(.ultraThinMaterial, in: Circle())
+                .background(Color(nsColor: .controlBackgroundColor), in: Circle())
         }
         .buttonStyle(.plain)
+    }
+}
+
+private struct AttachmentListView: View {
+    let attachments: [ChatAttachment]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ForEach(attachments) { attachment in
+                HStack(spacing: 10) {
+                    Image(systemName: "doc.text")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(attachment.displayTitle)
+                            .font(.system(size: 13, weight: .semibold))
+                            .lineLimit(1)
+                        Text("\(attachment.characterCount.formatted()) characters")
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer(minLength: 0)
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
+                .background(
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        .fill(Color(nsColor: .windowBackgroundColor).opacity(0.85))
+                )
+            }
+        }
     }
 }

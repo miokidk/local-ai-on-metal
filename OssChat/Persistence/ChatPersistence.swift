@@ -2,21 +2,33 @@ import Foundation
 
 actor ChatPersistence {
     private let fileManager = FileManager.default
-    private let appDirectoryName = "OssChat"
+    private let appDirectoryName = "llocust"
+    private let legacyAppDirectoryName = "OssChat"
     private let stateFileName = "Chats.json"
 
     private var stateURL: URL {
+        directoryURL(for: appDirectoryName).appendingPathComponent(stateFileName)
+    }
+
+    private var legacyStateURL: URL {
+        directoryURL(for: legacyAppDirectoryName).appendingPathComponent(stateFileName)
+    }
+
+    private func directoryURL(for appDirectoryName: String) -> URL {
         let baseURL = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
             ?? fileManager.homeDirectoryForCurrentUser
         let directoryURL = baseURL.appendingPathComponent(appDirectoryName, isDirectory: true)
         if !fileManager.fileExists(atPath: directoryURL.path) {
             try? fileManager.createDirectory(at: directoryURL, withIntermediateDirectories: true)
         }
-        return directoryURL.appendingPathComponent(stateFileName)
+        return directoryURL
     }
 
     func load() -> PersistedChatState? {
-        let url = stateURL
+        loadState(from: stateURL) ?? loadState(from: legacyStateURL)
+    }
+
+    private func loadState(from url: URL) -> PersistedChatState? {
         guard fileManager.fileExists(atPath: url.path) else { return nil }
 
         do {

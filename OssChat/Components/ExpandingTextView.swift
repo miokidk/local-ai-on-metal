@@ -25,8 +25,8 @@ struct ExpandingTextView: NSViewRepresentable {
         textView.importsGraphics = false
         textView.isAutomaticQuoteSubstitutionEnabled = false
         textView.isAutomaticDashSubstitutionEnabled = false
-        textView.font = .systemFont(ofSize: 15)
-        textView.textContainerInset = NSSize(width: 0, height: 2)
+        textView.font = .systemFont(ofSize: 17)
+        textView.textContainerInset = NSSize(width: 0, height: 4)
         textView.textContainer?.lineFragmentPadding = 0
         textView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
         textView.isHorizontallyResizable = false

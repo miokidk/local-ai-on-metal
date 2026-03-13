@@ -13,20 +13,25 @@ enum ReasoningEffort: String, Codable, CaseIterable, Identifiable {
 }
 
 struct AppSettings: Codable, Equatable {
-    static let defaultBaseURL = "http://127.0.0.1:11434/v1"
-    static let defaultModelName = "gpt-oss"
+    static let defaultBaseURL = "http://127.0.0.1:8412/v1"
+    static let fixedModelIdentifier = "gpt-oss-20b"
+    static let fixedModelName = "oss 20b Metal"
 
     var baseURLString: String = AppSettings.defaultBaseURL
-    var defaultModel: String = AppSettings.defaultModelName
-    var selectedModel: String = AppSettings.defaultModelName
-    var recentModels: [String] = [AppSettings.defaultModelName]
+    var defaultModel: String = AppSettings.fixedModelIdentifier
+    var selectedModel: String = AppSettings.fixedModelIdentifier
+    var recentModels: [String] = [AppSettings.fixedModelIdentifier]
     var selectedReasoningEffort: ReasoningEffort = .medium
-    var autoShowThoughts: Bool = true
+    var autoShowThoughts: Bool = false
     var apiKey: String = ""
+    var systemInstructions: String = ""
+
+    var modelDisplayName: String {
+        AppSettings.fixedModelName
+    }
 
     var resolvedBaseURL: URL? {
-        let trimmed = baseURLString.trimmingCharacters(in: .whitespacesAndNewlines)
-        return URL(string: trimmed)
+        URL(string: AppSettings.defaultBaseURL)
     }
 
     var sanitizedRecentModels: [String] {
@@ -38,13 +43,20 @@ struct AppSettings: Codable, Equatable {
             .filter { seen.insert($0).inserted }
     }
 
+    var trimmedSystemInstructions: String? {
+        let trimmed = systemInstructions.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
     mutating func registerModel(_ model: String) {
-        let trimmed = model.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        selectedModel = trimmed
-        if !recentModels.contains(trimmed) {
-            recentModels.insert(trimmed, at: 0)
-        }
-        recentModels = Array(recentModels.prefix(12))
+        _ = model
+        selectedModel = AppSettings.fixedModelIdentifier
+        defaultModel = AppSettings.fixedModelIdentifier
+        recentModels = [AppSettings.fixedModelIdentifier]
+    }
+
+    mutating func normalizeForSingleModel() {
+        baseURLString = AppSettings.defaultBaseURL
+        registerModel(AppSettings.fixedModelIdentifier)
     }
 }

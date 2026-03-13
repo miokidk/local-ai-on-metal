@@ -1,7 +1,7 @@
 import SwiftUI
 
 @main
-struct OssChatApp: App {
+struct LlocustApp: App {
     @StateObject private var store = ChatStore()
 
     var body: some Scene {
