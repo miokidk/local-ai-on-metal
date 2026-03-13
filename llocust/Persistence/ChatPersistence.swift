@@ -3,15 +3,10 @@ import Foundation
 actor ChatPersistence {
     private let fileManager = FileManager.default
     private let appDirectoryName = "llocust"
-    private let legacyAppDirectoryName = "OssChat"
     private let stateFileName = "Chats.json"
 
     private var stateURL: URL {
         directoryURL(for: appDirectoryName).appendingPathComponent(stateFileName)
-    }
-
-    private var legacyStateURL: URL {
-        directoryURL(for: legacyAppDirectoryName).appendingPathComponent(stateFileName)
     }
 
     private func directoryURL(for appDirectoryName: String) -> URL {
@@ -25,7 +20,7 @@ actor ChatPersistence {
     }
 
     func load() -> PersistedChatState? {
-        loadState(from: stateURL) ?? loadState(from: legacyStateURL)
+        loadState(from: stateURL)
     }
 
     private func loadState(from url: URL) -> PersistedChatState? {

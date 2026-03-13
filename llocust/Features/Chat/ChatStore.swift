@@ -35,7 +35,6 @@ final class ChatStore: ObservableObject {
     private let localServer = LocalModelServer()
     private let userDefaults = UserDefaults.standard
     private let settingsKey = "llocust.Settings"
-    private let legacySettingsKey = "OssChat.Settings"
 
     private var saveTask: Task<Void, Never>?
     private var streamTasks: [UUID: Task<Void, Never>] = [:]
@@ -44,7 +43,7 @@ final class ChatStore: ObservableObject {
 
     init() {
         if
-            let data = userDefaults.data(forKey: settingsKey) ?? userDefaults.data(forKey: legacySettingsKey),
+            let data = userDefaults.data(forKey: settingsKey),
             let decoded = try? JSONDecoder().decode(AppSettings.self, from: data)
         {
             settings = decoded
@@ -281,30 +280,47 @@ final class ChatStore: ObservableObject {
             guard let self else { return }
 
             do {
-                try await self.localServer.ensureRunning()
-                let metadata = try await self.client.resolveServerMetadata(
-                    preferredBaseURL: baseURL,
-                    apiKey: self.settings.apiKey.nonEmpty
-                )
-                self.applyResolvedServerMetadata(metadata)
+                var didAttemptRecovery = false
 
-                let selectedModel = self.resolvePreferredModel(from: metadata.models)
-                self.settings.registerModel(selectedModel)
+                while true {
+                    do {
+                        try await self.localServer.ensureRunning()
+                        let metadata = try await self.client.resolveServerMetadata(
+                            preferredBaseURL: baseURL,
+                            apiKey: self.settings.apiKey.nonEmpty
+                        )
+                        self.applyResolvedServerMetadata(metadata)
 
-                let request = ResponsesAPIRequest(
-                    requestID: requestID,
-                    baseURL: metadata.baseURL,
-                    apiKey: self.settings.apiKey.nonEmpty,
-                    model: selectedModel,
-                    reasoningEffort: self.settings.selectedReasoningEffort,
-                    instructions: self.settings.trimmedSystemInstructions,
-                    messages: Array(history)
-                )
+                        let selectedModel = self.resolvePreferredModel(from: metadata.models)
+                        self.settings.registerModel(selectedModel)
 
-                let stream = self.client.streamResponse(for: request)
-                for try await event in stream {
-                    self.consume(event, conversationID: conversationID)
+                        let request = ResponsesAPIRequest(
+                            requestID: requestID,
+                            baseURL: metadata.baseURL,
+                            apiKey: self.settings.apiKey.nonEmpty,
+                            model: selectedModel,
+                            reasoningEffort: self.settings.selectedReasoningEffort,
+                            instructions: self.settings.trimmedSystemInstructions,
+                            messages: Array(history)
+                        )
+
+                        let stream = self.client.streamResponse(for: request)
+                        for try await event in stream {
+                            self.consume(event, conversationID: conversationID)
+                        }
+                        break
+                    } catch is CancellationError {
+                        throw CancellationError()
+                    } catch {
+                        guard !didAttemptRecovery, self.shouldRecoverFromServerError(error) else {
+                            throw error
+                        }
+
+                        didAttemptRecovery = true
+                        try await self.localServer.forceRestart()
+                    }
                 }
+
                 self.finishStreaming(in: conversationID)
             } catch is CancellationError {
                 self.finishStreaming(in: conversationID, preservePartialResult: true)
@@ -654,6 +670,19 @@ final class ChatStore: ObservableObject {
         guard !trimmed.isEmpty else { return nil }
         return trimmed
     }
+
+    private func shouldRecoverFromServerError(_ error: Error) -> Bool {
+        guard case let ResponsesAPIError.server(status, message) = error else {
+            return false
+        }
+
+        guard status == 500 else {
+            return false
+        }
+
+        let normalizedMessage = message.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return normalizedMessage.isEmpty || normalizedMessage == "internal server error"
+    }
 }
 
 private extension String {
@@ -739,6 +768,23 @@ private actor LocalModelServer {
     func stopIfNeeded() async {
         guard ownsProcess, let process, process.isRunning else { return }
         process.terminate()
+    }
+
+    func forceRestart() async throws {
+        if ownsProcess, let process, process.isRunning {
+            process.terminate()
+        }
+
+        handleProcessTermination()
+        try terminateAnyServerListeningOnPort()
+        try validateRuntime()
+        try startProcess()
+
+        guard let process else {
+            throw LocalModelServerError.startupFailed("The local server could not be relaunched.")
+        }
+
+        try await waitUntilReachableOrExit(process)
     }
 
     private func validateRuntime() throws {
@@ -865,6 +911,38 @@ private actor LocalModelServer {
     private func recentLogSummary() -> String? {
         let trimmed = recentLogs.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private func terminateAnyServerListeningOnPort() throws {
+        let lsof = Process()
+        let outputPipe = Pipe()
+        lsof.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
+        lsof.arguments = [
+            "-tiTCP:\(baseURL.port ?? 8412)",
+            "-sTCP:LISTEN"
+        ]
+        lsof.standardOutput = outputPipe
+        lsof.standardError = Pipe()
+
+        try lsof.run()
+        lsof.waitUntilExit()
+
+        guard lsof.terminationStatus == 0 else {
+            return
+        }
+
+        let data = outputPipe.fileHandleForReading.readDataToEndOfFile()
+        let processIDs = String(decoding: data, as: UTF8.self)
+            .split(whereSeparator: \.isNewline)
+            .compactMap { Int32($0) }
+
+        for processID in processIDs {
+            kill(processID, SIGTERM)
+        }
+
+        if !processIDs.isEmpty {
+            Thread.sleep(forTimeInterval: 0.5)
+        }
     }
 }
 

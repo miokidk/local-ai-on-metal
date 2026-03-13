@@ -183,6 +183,7 @@ final class ResponsesAPIClient {
         urlRequest.timeoutInterval = 180
         urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
         urlRequest.setValue("application/json", forHTTPHeaderField: "Accept")
+        urlRequest.setValue(request.requestID, forHTTPHeaderField: "X-OssChat-Request-ID")
         urlRequest.setValue(request.requestID, forHTTPHeaderField: "X-llocust-Request-ID")
 
         if let apiKey = request.apiKey?.trimmingCharacters(in: .whitespacesAndNewlines), !apiKey.isEmpty {
@@ -332,6 +333,22 @@ final class ResponsesAPIClient {
             let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
             let error = object["error"] as? [String: Any],
             let message = error["message"] as? String
+        {
+            return message
+        }
+
+        if
+            let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+            let detail = object["detail"] as? String,
+            !detail.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        {
+            return detail
+        }
+
+        if
+            let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+            let message = object["message"] as? String,
+            !message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         {
             return message
         }

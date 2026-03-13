@@ -7,7 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
-		A00100010000000000000001 /* OssChatApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00200010000000000000001 /* OssChatApp.swift */; };
+		A00100010000000000000001 /* LlocustApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00200010000000000000001 /* LlocustApp.swift */; };
 		A00100010000000000000002 /* AppCommands.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00200010000000000000002 /* AppCommands.swift */; };
 		A00100010000000000000003 /* ChatModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00200010000000000000003 /* ChatModels.swift */; };
 		A00100010000000000000004 /* AppSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00200010000000000000004 /* AppSettings.swift */; };
@@ -29,7 +29,7 @@
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
-		A00200010000000000000001 /* OssChatApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OssChatApp.swift; sourceTree = "<group>"; };
+		A00200010000000000000001 /* LlocustApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LlocustApp.swift; sourceTree = "<group>"; };
 		A00200010000000000000002 /* AppCommands.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppCommands.swift; sourceTree = "<group>"; };
 		A00200010000000000000003 /* ChatModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatModels.swift; sourceTree = "<group>"; };
 		A00200010000000000000004 /* AppSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppSettings.swift; sourceTree = "<group>"; };
@@ -65,12 +65,12 @@
 		A00400010000000000000001 = {
 			isa = PBXGroup;
 			children = (
-				A00400010000000000000002 /* OssChat */,
+				A00400010000000000000002 /* llocust */,
 				A0040001000000000000000A /* Products */,
 			);
 			sourceTree = "<group>";
 		};
-		A00400010000000000000002 /* OssChat */ = {
+		A00400010000000000000002 /* llocust */ = {
 			isa = PBXGroup;
 			children = (
 				A00400010000000000000003 /* App */,
@@ -81,13 +81,13 @@
 				A00400010000000000000008 /* Components */,
 				A00400010000000000000009 /* Resources */,
 			);
-			path = OssChat;
+			path = llocust;
 			sourceTree = "<group>";
 		};
 		A00400010000000000000003 /* App */ = {
 			isa = PBXGroup;
 			children = (
-				A00200010000000000000001 /* OssChatApp.swift */,
+				A00200010000000000000001 /* LlocustApp.swift */,
 				A00200010000000000000002 /* AppCommands.swift */,
 			);
 			path = App;
@@ -179,9 +179,9 @@
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
-		A00500010000000000000001 /* OssChat */ = {
+		A00500010000000000000001 /* llocust */ = {
 			isa = PBXNativeTarget;
-			buildConfigurationList = A00600010000000000000002 /* Build configuration list for PBXNativeTarget "OssChat" */;
+			buildConfigurationList = A00600010000000000000002 /* Build configuration list for PBXNativeTarget "llocust" */;
 			buildPhases = (
 				A00300010000000000000002 /* Sources */,
 				A00300010000000000000001 /* Frameworks */,
@@ -191,7 +191,7 @@
 			);
 			dependencies = (
 			);
-			name = OssChat;
+			name = llocust;
 			productName = llocust;
 			productReference = A00200010000000000000014 /* llocust.app */;
 			productType = "com.apple.product-type.application";
@@ -211,7 +211,7 @@
 					};
 				};
 			};
-			buildConfigurationList = A00600010000000000000001A /* Build configuration list for PBXProject "OssChat" */;
+			buildConfigurationList = A00600010000000000000001A /* Build configuration list for PBXProject "llocust" */;
 			compatibilityVersion = "Xcode 14.0";
 			developmentRegion = en;
 			hasScannedForEncodings = 0;
@@ -224,7 +224,7 @@
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
-				A00500010000000000000001 /* OssChat */,
+				A00500010000000000000001 /* llocust */,
 			);
 		};
 /* End PBXProject section */
@@ -245,7 +245,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				A00100010000000000000001 /* OssChatApp.swift in Sources */,
+				A00100010000000000000001 /* LlocustApp.swift in Sources */,
 				A00100010000000000000002 /* AppCommands.swift in Sources */,
 				A00100010000000000000003 /* ChatModels.swift in Sources */,
 				A00100010000000000000004 /* AppSettings.swift in Sources */,
@@ -363,7 +363,7 @@
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
-		A00600010000000000000001A /* Build configuration list for PBXProject "OssChat" */ = {
+		A00600010000000000000001A /* Build configuration list for PBXProject "llocust" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
 				A00600010000000000000003 /* Debug */,
@@ -372,7 +372,7 @@
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
-		A00600010000000000000002 /* Build configuration list for PBXNativeTarget "OssChat" */ = {
+		A00600010000000000000002 /* Build configuration list for PBXNativeTarget "llocust" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
 				A00600010000000000000005 /* Debug */,
