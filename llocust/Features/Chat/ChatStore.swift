@@ -300,6 +300,7 @@ final class ChatStore: ObservableObject {
                             apiKey: self.settings.apiKey.nonEmpty,
                             model: selectedModel,
                             reasoningEffort: self.settings.selectedReasoningEffort,
+                            repeatPenalty: self.settings.repeatPenalty,
                             instructions: self.settings.trimmedSystemInstructions,
                             messages: Array(history)
                         )

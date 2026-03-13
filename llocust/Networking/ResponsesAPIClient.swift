@@ -26,6 +26,7 @@ struct ResponsesAPIRequest {
     let apiKey: String?
     let model: String
     let reasoningEffort: ReasoningEffort
+    let repeatPenalty: Double
     let instructions: String?
     let messages: [ChatMessage]
 }
@@ -220,6 +221,7 @@ final class ResponsesAPIClient {
             "model": request.model,
             "input": input,
             "stream": streaming,
+            "frequency_penalty": request.repeatPenalty,
             "reasoning": [
                 "effort": request.reasoningEffort.rawValue
             ]

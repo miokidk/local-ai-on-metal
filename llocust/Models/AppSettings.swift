@@ -16,12 +16,14 @@ struct AppSettings: Codable, Equatable {
     static let defaultBaseURL = "http://127.0.0.1:8412/v1"
     static let fixedModelIdentifier = "gpt-oss-20b"
     static let fixedModelName = "oss 20b Metal"
+    static let defaultRepeatPenalty = 0.4
 
     var baseURLString: String = AppSettings.defaultBaseURL
     var defaultModel: String = AppSettings.fixedModelIdentifier
     var selectedModel: String = AppSettings.fixedModelIdentifier
     var recentModels: [String] = [AppSettings.fixedModelIdentifier]
     var selectedReasoningEffort: ReasoningEffort = .medium
+    var repeatPenalty: Double = AppSettings.defaultRepeatPenalty
     var autoShowThoughts: Bool = false
     var apiKey: String = ""
     var systemInstructions: String = ""
@@ -58,5 +60,12 @@ struct AppSettings: Codable, Equatable {
     mutating func normalizeForSingleModel() {
         baseURLString = AppSettings.defaultBaseURL
         registerModel(AppSettings.fixedModelIdentifier)
+        repeatPenalty = repeatPenalty.clamped(to: 0...2)
+    }
+}
+
+private extension Comparable {
+    func clamped(to limits: ClosedRange<Self>) -> Self {
+        min(max(self, limits.lowerBound), limits.upperBound)
     }
 }
