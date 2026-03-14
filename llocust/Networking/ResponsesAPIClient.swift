@@ -27,6 +27,7 @@ struct ResponsesAPIRequest {
     let model: String
     let reasoningEffort: ReasoningEffort
     let repeatPenalty: Double
+    let maxOutputTokens: Int?
     let instructions: String?
     let messages: [ChatMessage]
 }
@@ -154,7 +155,13 @@ final class ResponsesAPIClient {
         continuation: AsyncThrowingStream<ResponsesAPIStreamEvent, Error>.Continuation
     ) async throws {
         let urlRequest = try makeURLRequest(for: request, streaming: true)
-        let (bytes, response) = try await session.bytes(for: urlRequest)
+        let (bytes, response): (URLSession.AsyncBytes, URLResponse)
+
+        do {
+            (bytes, response) = try await session.bytes(for: urlRequest)
+        } catch let error as URLError {
+            throw translated(urlError: error)
+        }
 
         guard let httpResponse = response as? HTTPURLResponse else {
             throw ResponsesAPIError.malformedResponse
@@ -230,6 +237,9 @@ final class ResponsesAPIClient {
         var finalizedPayload = payload
         if let instructions = request.instructions?.trimmingCharacters(in: .whitespacesAndNewlines), !instructions.isEmpty {
             finalizedPayload["instructions"] = instructions
+        }
+        if let maxOutputTokens = request.maxOutputTokens {
+            finalizedPayload["max_output_tokens"] = maxOutputTokens
         }
 
         urlRequest.httpBody = try JSONSerialization.data(withJSONObject: finalizedPayload, options: [])
@@ -388,7 +398,8 @@ final class ResponsesAPIClient {
 
             do {
                 let (_, response) = try await session.data(for: request)
-                if response is HTTPURLResponse {
+                if let httpResponse = response as? HTTPURLResponse,
+                   isReachableResponsesStatus(httpResponse.statusCode) {
                     return baseURL
                 }
             } catch {
@@ -401,6 +412,10 @@ final class ResponsesAPIClient {
         }
 
         return nil
+    }
+
+    private func isReachableResponsesStatus(_ statusCode: Int) -> Bool {
+        (200...299).contains(statusCode) || statusCode == 401 || statusCode == 403 || statusCode == 405
     }
 
     private func candidateBaseURLs(from preferredBaseURL: URL) -> [URL] {

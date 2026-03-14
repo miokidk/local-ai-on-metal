@@ -39,6 +39,8 @@ final class ChatStore: ObservableObject {
     private var saveTask: Task<Void, Never>?
     private var streamTasks: [UUID: Task<Void, Never>] = [:]
     private var streamRequestIDs: [UUID: String] = [:]
+    private var prewarmTask: Task<Void, Never>?
+    private var didCompletePrewarm = false
     private let pinnedBaseURL = URL(string: AppSettings.defaultBaseURL)!
 
     init() {
@@ -53,10 +55,14 @@ final class ChatStore: ObservableObject {
 
         settings.normalizeForSingleModel()
         persistSettings()
+        connectionState = .checking
+
+        Task {
+            await refreshServerMetadataNow()
+        }
 
         Task {
             await loadPersistedState()
-            await refreshServerMetadataNow()
         }
     }
 
@@ -159,10 +165,15 @@ final class ChatStore: ObservableObject {
     }
 
     func cancelGenerationForSelectedConversation() {
-        stopAllModelActivity()
+        guard let conversationID = selectedConversation?.id ?? selectedConversationID else { return }
+        cancelGeneration(for: conversationID)
     }
 
-    func cancelGeneration(for conversationID: UUID) {
+    func cancelGeneration(for conversationID: UUID, sendRemoteCancel: Bool = true) {
+        let requestID = streamRequestIDs[conversationID]
+        let apiKey = settings.apiKey.nonEmpty
+        let baseURL = pinnedBaseURL
+
         streamTasks[conversationID]?.cancel()
         streamTasks[conversationID] = nil
         streamRequestIDs[conversationID] = nil
@@ -170,6 +181,11 @@ final class ChatStore: ObservableObject {
         guard let conversationIndex = indexForConversation(conversationID),
               let assistantIndex = conversations[conversationIndex].messages.lastIndex(where: { $0.role == .assistant && $0.state == .streaming }) else {
             scheduleSave()
+            if sendRemoteCancel, let requestID {
+                Task { [client] in
+                    try? await client.cancelResponses(baseURL: baseURL, apiKey: apiKey, requestIDs: [requestID])
+                }
+            }
             return
         }
 
@@ -182,6 +198,12 @@ final class ChatStore: ObservableObject {
         }
 
         touchConversation(at: conversationIndex)
+
+        guard sendRemoteCancel, let requestID else { return }
+
+        Task { [client] in
+            try? await client.cancelResponses(baseURL: baseURL, apiKey: apiKey, requestIDs: [requestID])
+        }
     }
 
     func stopAllModelActivity() {
@@ -190,7 +212,7 @@ final class ChatStore: ObservableObject {
         let apiKey = settings.apiKey.nonEmpty
         let baseURL = pinnedBaseURL
 
-        conversationIDs.forEach(cancelGeneration(for:))
+        conversationIDs.forEach { cancelGeneration(for: $0, sendRemoteCancel: false) }
 
         guard !requestIDs.isEmpty else { return }
 
@@ -266,8 +288,8 @@ final class ChatStore: ObservableObject {
               let conversationIndex = indexForConversation(conversationID) else { return }
 
         settings.normalizeForSingleModel()
-        let baseURLString = AppSettings.defaultBaseURL
-        let baseURL = pinnedBaseURL
+        prewarmTask?.cancel()
+        prewarmTask = nil
 
         let assistantMessage = ChatMessage(role: .assistant, content: "", thoughts: nil, state: .streaming)
         conversations[conversationIndex].messages.append(assistantMessage)
@@ -275,50 +297,54 @@ final class ChatStore: ObservableObject {
 
         let history = conversations[conversationIndex].messages.dropLast().filter { $0.hasVisibleContent }
         let requestID = UUID().uuidString
+        let request = ResponsesAPIRequest(
+            requestID: requestID,
+            baseURL: pinnedBaseURL,
+            apiKey: settings.apiKey.nonEmpty,
+            model: AppSettings.fixedModelIdentifier,
+            reasoningEffort: settings.selectedReasoningEffort,
+            repeatPenalty: settings.repeatPenalty,
+            maxOutputTokens: nil,
+            instructions: settings.trimmedSystemInstructions,
+            messages: Array(history)
+        )
 
         let task = Task { [weak self] in
             guard let self else { return }
+            let requestedBaseURL = AppSettings.defaultBaseURL
 
             do {
+                var didAttemptEnsureRunning = false
                 var didAttemptRecovery = false
 
                 while true {
                     do {
-                        try await self.localServer.ensureRunning()
-                        let metadata = try await self.client.resolveServerMetadata(
-                            preferredBaseURL: baseURL,
-                            apiKey: self.settings.apiKey.nonEmpty
-                        )
-                        self.applyResolvedServerMetadata(metadata)
-
-                        let selectedModel = self.resolvePreferredModel(from: metadata.models)
-                        self.settings.registerModel(selectedModel)
-
-                        let request = ResponsesAPIRequest(
-                            requestID: requestID,
-                            baseURL: metadata.baseURL,
-                            apiKey: self.settings.apiKey.nonEmpty,
-                            model: selectedModel,
-                            reasoningEffort: self.settings.selectedReasoningEffort,
-                            repeatPenalty: self.settings.repeatPenalty,
-                            instructions: self.settings.trimmedSystemInstructions,
-                            messages: Array(history)
-                        )
-
+                        self.applyResolvedServerMetadata(self.fixedServerMetadata())
                         let stream = self.client.streamResponse(for: request)
                         for try await event in stream {
+                            try Task.checkCancellation()
                             self.consume(event, conversationID: conversationID)
                         }
                         break
                     } catch is CancellationError {
                         throw CancellationError()
                     } catch {
+                        if !didAttemptEnsureRunning, self.shouldRetryAfterEnsuringServer(error) {
+                            didAttemptEnsureRunning = true
+                            self.connectionState = .checking
+                            try await self.localServer.ensureRunning()
+                            self.applyResolvedServerMetadata(self.fixedServerMetadata())
+                            continue
+                        }
+
                         guard !didAttemptRecovery, self.shouldRecoverFromServerError(error) else {
                             throw error
                         }
 
                         didAttemptRecovery = true
+                        self.connectionState = .checking
                         try await self.localServer.forceRestart()
+                        self.applyResolvedServerMetadata(self.fixedServerMetadata())
                     }
                 }
 
@@ -326,7 +352,7 @@ final class ChatStore: ObservableObject {
             } catch is CancellationError {
                 self.finishStreaming(in: conversationID, preservePartialResult: true)
             } catch {
-                let message = self.friendlyMessage(for: error, requestedBaseURL: baseURLString)
+                let message = self.friendlyMessage(for: error, requestedBaseURL: requestedBaseURL)
                 self.markAssistantError(message, in: conversationID)
                 self.connectionState = .failed(message)
             }
@@ -622,6 +648,13 @@ final class ChatStore: ObservableObject {
         return "Couldn’t attach that file."
     }
 
+    private func fixedServerMetadata() -> ResponsesServerMetadata {
+        ResponsesServerMetadata(
+            baseURL: pinnedBaseURL,
+            models: [AppSettings.fixedModelIdentifier]
+        )
+    }
+
     private func applyResolvedServerMetadata(_ metadata: ResponsesServerMetadata) {
         let models = metadata.models.isEmpty ? [AppSettings.fixedModelIdentifier] : metadata.models
         availableModels = models
@@ -654,13 +687,10 @@ final class ChatStore: ObservableObject {
     }
 
     private func refreshServerMetadataNow() async {
-        let baseURL = pinnedBaseURL
-        let apiKey = settings.apiKey.nonEmpty
-
         do {
             try await localServer.ensureRunning()
-            let metadata = try await client.resolveServerMetadata(preferredBaseURL: baseURL, apiKey: apiKey)
-            applyResolvedServerMetadata(metadata)
+            applyResolvedServerMetadata(fixedServerMetadata())
+            scheduleModelPrewarmIfNeeded()
         } catch {
             connectionState = .failed(friendlyMessage(for: error))
         }
@@ -683,6 +713,66 @@ final class ChatStore: ObservableObject {
 
         let normalizedMessage = message.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         return normalizedMessage.isEmpty || normalizedMessage == "internal server error"
+    }
+
+    private func shouldRetryAfterEnsuringServer(_ error: Error) -> Bool {
+        if case ResponsesAPIError.serverUnavailable = error {
+            return true
+        }
+
+        if let urlError = error as? URLError {
+            switch urlError.code {
+            case .cannotConnectToHost, .cannotFindHost, .networkConnectionLost, .notConnectedToInternet, .timedOut:
+                return true
+            default:
+                return false
+            }
+        }
+
+        return false
+    }
+
+    private func scheduleModelPrewarmIfNeeded() {
+        guard !didCompletePrewarm, prewarmTask == nil else { return }
+
+        let warmupMessage = ChatMessage(
+            role: .user,
+            content: "Reply with exactly one word: ready."
+        )
+        let request = ResponsesAPIRequest(
+            requestID: UUID().uuidString,
+            baseURL: pinnedBaseURL,
+            apiKey: settings.apiKey.nonEmpty,
+            model: AppSettings.fixedModelIdentifier,
+            reasoningEffort: .low,
+            repeatPenalty: 0,
+            maxOutputTokens: 1,
+            instructions: nil,
+            messages: [warmupMessage]
+        )
+
+        prewarmTask = Task { [weak self] in
+            guard let self else { return }
+
+            defer {
+                self.prewarmTask = nil
+            }
+
+            do {
+                try await Task.sleep(for: .milliseconds(250))
+
+                let stream = self.client.streamResponse(for: request)
+                for try await _ in stream {
+                    try Task.checkCancellation()
+                }
+
+                self.didCompletePrewarm = true
+            } catch is CancellationError {
+                return
+            } catch {
+                return
+            }
+        }
     }
 }
 
@@ -888,10 +978,17 @@ private actor LocalModelServer {
 
         do {
             let (_, response) = try await session.data(for: request)
-            return response is HTTPURLResponse
+            guard let httpResponse = response as? HTTPURLResponse else {
+                return false
+            }
+            return isReachableResponsesStatus(httpResponse.statusCode)
         } catch {
             return false
         }
+    }
+
+    private func isReachableResponsesStatus(_ statusCode: Int) -> Bool {
+        (200...299).contains(statusCode) || statusCode == 401 || statusCode == 403 || statusCode == 405
     }
 
     private func appendLogs(_ chunk: String) {
