@@ -6,36 +6,96 @@ struct ChatRootView: View {
     @State private var columnVisibility: NavigationSplitViewVisibility = .all
 
     var body: some View {
-        NavigationSplitView(columnVisibility: $columnVisibility) {
-            SidebarView(
-                store: store,
-                showsSettingsToolbarItem: isSidebarVisible
-            )
-        } detail: {
-            ConversationDetailView(
-                store: store,
-                conversation: store.selectedConversation
-            )
+        Group {
+            if store.isLaunchReady {
+                NavigationSplitView(columnVisibility: $columnVisibility) {
+                    SidebarView(
+                        store: store,
+                        showsSettingsToolbarItem: isSidebarVisible
+                    )
+                } detail: {
+                    ConversationDetailView(
+                        store: store,
+                        conversation: store.selectedConversation
+                    )
+                }
+                .navigationSplitViewStyle(.balanced)
+                .background(TitlebarLocustAccessoryInstaller())
+                .toolbar {
+                    ToolbarItem(placement: .primaryAction) {
+                        Button {
+                            store.startNewConversation()
+                        } label: {
+                            Image(systemName: "square.and.pencil")
+                        }
+                        .help("New Chat")
+                    }
+                }
+            } else {
+                LaunchScreenView(
+                    errorMessage: store.launchErrorMessage,
+                    onRetry: store.retryLaunchPreparation
+                )
+            }
         }
-        .navigationSplitViewStyle(.balanced)
         .sheet(isPresented: $store.isShowingSettings) {
             SettingsView(store: store)
-        }
-        .background(TitlebarLocustAccessoryInstaller())
-        .toolbar {
-            ToolbarItem(placement: .primaryAction) {
-                Button {
-                    store.startNewConversation()
-                } label: {
-                    Image(systemName: "square.and.pencil")
-                }
-                .help("New Chat")
-            }
         }
     }
 
     private var isSidebarVisible: Bool {
         columnVisibility != .detailOnly
+    }
+}
+
+private struct LaunchScreenView: View {
+    let errorMessage: String?
+    let onRetry: () -> Void
+
+    var body: some View {
+        ZStack {
+            LinearGradient(
+                colors: [
+                    Color(nsColor: .windowBackgroundColor),
+                    Color(nsColor: .controlBackgroundColor).opacity(0.8)
+                ],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+            .ignoresSafeArea()
+
+            VStack(spacing: 20) {
+                Image("LocustMark")
+                    .resizable()
+                    .interpolation(.high)
+                    .aspectRatio(contentMode: .fit)
+                    .frame(width: 110, height: 52)
+
+                if let errorMessage {
+                    VStack(spacing: 12) {
+                        Text("Couldn’t start the local model")
+                            .font(.system(size: 22, weight: .semibold))
+                        Text(errorMessage)
+                            .font(.system(size: 14, weight: .medium))
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.center)
+                            .textSelection(.enabled)
+                            .frame(maxWidth: 560)
+                        Button("Try Again", action: onRetry)
+                            .buttonStyle(.borderedProminent)
+                    }
+                } else {
+                    ProgressView()
+                        .controlSize(.regular)
+                    Text("Starting oss 20b Metal…")
+                        .font(.system(size: 22, weight: .semibold))
+                    Text("The app will open as soon as the model is warm and ready.")
+                        .font(.system(size: 14, weight: .medium))
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .padding(40)
+        }
     }
 }
 

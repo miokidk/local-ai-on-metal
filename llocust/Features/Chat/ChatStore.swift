@@ -24,6 +24,8 @@ final class ChatStore: ObservableObject {
     @Published var isShowingSettings: Bool = false
     @Published private(set) var availableModels: [String] = []
     @Published private(set) var connectionState: ConnectionState = .idle
+    @Published private(set) var isLaunchReady = false
+    @Published private(set) var launchErrorMessage: String?
     @Published var settings: AppSettings {
         didSet {
             persistSettings()
@@ -39,8 +41,12 @@ final class ChatStore: ObservableObject {
     private var saveTask: Task<Void, Never>?
     private var streamTasks: [UUID: Task<Void, Never>] = [:]
     private var streamRequestIDs: [UUID: String] = [:]
-    private var prewarmTask: Task<Void, Never>?
+    private var rawOutputBuffers: [UUID: String] = [:]
+    private var rawThoughtBuffers: [UUID: String] = [:]
+    private var launchPreparationTask: Task<Void, Never>?
     private var didCompletePrewarm = false
+    private var didLoadPersistedState = false
+    private var didPrepareLaunchModel = false
     private let pinnedBaseURL = URL(string: AppSettings.defaultBaseURL)!
 
     init() {
@@ -55,11 +61,7 @@ final class ChatStore: ObservableObject {
 
         settings.normalizeForSingleModel()
         persistSettings()
-        connectionState = .checking
-
-        Task {
-            await refreshServerMetadataNow()
-        }
+        startLaunchPreparationIfNeeded()
 
         Task {
             await loadPersistedState()
@@ -99,6 +101,9 @@ final class ChatStore: ObservableObject {
         } else if selectedConversationID == nil {
             selectedConversationID = conversations.first?.id
         }
+
+        didLoadPersistedState = true
+        updateLaunchReadiness()
     }
 
     func startNewConversation() {
@@ -177,6 +182,7 @@ final class ChatStore: ObservableObject {
         streamTasks[conversationID]?.cancel()
         streamTasks[conversationID] = nil
         streamRequestIDs[conversationID] = nil
+        clearRawStreamingBuffers(for: conversationID)
 
         guard let conversationIndex = indexForConversation(conversationID),
               let assistantIndex = conversations[conversationIndex].messages.lastIndex(where: { $0.role == .assistant && $0.state == .streaming }) else {
@@ -195,6 +201,7 @@ final class ChatStore: ObservableObject {
             conversations[conversationIndex].messages.remove(at: assistantIndex)
         } else {
             conversations[conversationIndex].messages[assistantIndex].state = .complete
+            conversations[conversationIndex].messages[assistantIndex].isThoughtsStreaming = false
         }
 
         touchConversation(at: conversationIndex)
@@ -283,16 +290,31 @@ final class ChatStore: ObservableObject {
         }
     }
 
+    func retryLaunchPreparation() {
+        launchErrorMessage = nil
+        isLaunchReady = false
+
+        Task { [weak self] in
+            await self?.refreshServerMetadataNow()
+        }
+    }
+
     private func requestAssistantReply(for conversationID: UUID) {
         guard streamTasks[conversationID] == nil,
               let conversationIndex = indexForConversation(conversationID) else { return }
 
         settings.normalizeForSingleModel()
-        prewarmTask?.cancel()
-        prewarmTask = nil
 
-        let assistantMessage = ChatMessage(role: .assistant, content: "", thoughts: nil, state: .streaming)
+        let assistantMessage = ChatMessage(
+            role: .assistant,
+            content: "",
+            thoughts: nil,
+            isThoughtsStreaming: true,
+            state: .streaming
+        )
         conversations[conversationIndex].messages.append(assistantMessage)
+        rawOutputBuffers[conversationID] = ""
+        rawThoughtBuffers[conversationID] = ""
         touchConversation(at: conversationIndex)
 
         let history = conversations[conversationIndex].messages.dropLast().filter { $0.hasVisibleContent }
@@ -314,6 +336,10 @@ final class ChatStore: ObservableObject {
             let requestedBaseURL = AppSettings.defaultBaseURL
 
             do {
+                if let launchPreparationTask = self.launchPreparationTask {
+                    await launchPreparationTask.value
+                }
+
                 var didAttemptEnsureRunning = false
                 var didAttemptRecovery = false
 
@@ -368,22 +394,35 @@ final class ChatStore: ObservableObject {
 
         switch event {
         case .thoughtsDelta(let delta):
-            let combined = (conversations[conversationIndex].messages[messageIndex].thoughts ?? "") + delta
-            conversations[conversationIndex].messages[messageIndex].thoughts = normalizedThoughts(combined)
+            let combined = (rawThoughtBuffers[conversationID] ?? conversations[conversationIndex].messages[messageIndex].thoughts ?? "") + delta
+            rawThoughtBuffers[conversationID] = combined
+            conversations[conversationIndex].messages[messageIndex].thoughts = normalizedThoughts(
+                ModelOutputSanitizer.sanitize(combined)
+            )
+            conversations[conversationIndex].messages[messageIndex].isThoughtsStreaming = true
         case .outputDelta(let delta):
-            conversations[conversationIndex].messages[messageIndex].content += delta
+            let combined = (rawOutputBuffers[conversationID] ?? conversations[conversationIndex].messages[messageIndex].content) + delta
+            rawOutputBuffers[conversationID] = combined
+            conversations[conversationIndex].messages[messageIndex].content = ModelOutputSanitizer.sanitize(combined)
+            conversations[conversationIndex].messages[messageIndex].isThoughtsStreaming = false
         case .completed(let finalText, let thoughts):
-            if let finalText, finalText.count > conversations[conversationIndex].messages[messageIndex].content.count {
-                conversations[conversationIndex].messages[messageIndex].content = finalText
+            if let finalText {
+                rawOutputBuffers[conversationID] = finalText
+                conversations[conversationIndex].messages[messageIndex].content = ModelOutputSanitizer.sanitize(finalText)
             }
             if let thoughts {
-                let normalizedThoughts = normalizedThoughts(thoughts)
+                rawThoughtBuffers[conversationID] = thoughts
+                let normalizedThoughts = normalizedThoughts(ModelOutputSanitizer.sanitize(thoughts))
                 let currentThoughtCount = (conversations[conversationIndex].messages[messageIndex].thoughts ?? "").count
-                if let normalizedThoughts, normalizedThoughts.count > currentThoughtCount {
+                if let normalizedThoughts, normalizedThoughts.count >= currentThoughtCount {
                     conversations[conversationIndex].messages[messageIndex].thoughts = normalizedThoughts
                 } else if normalizedThoughts == nil {
                     conversations[conversationIndex].messages[messageIndex].thoughts = nil
                 }
+
+                conversations[conversationIndex].messages[messageIndex].isThoughtsStreaming = false
+            } else if finalText != nil {
+                conversations[conversationIndex].messages[messageIndex].isThoughtsStreaming = false
             }
         }
 
@@ -393,6 +432,7 @@ final class ChatStore: ObservableObject {
     private func finishStreaming(in conversationID: UUID, preservePartialResult: Bool = false) {
         streamTasks[conversationID] = nil
         streamRequestIDs[conversationID] = nil
+        clearRawStreamingBuffers(for: conversationID)
 
         guard let conversationIndex = indexForConversation(conversationID),
               let messageIndex = conversations[conversationIndex].messages.lastIndex(where: { $0.role == .assistant }) else {
@@ -409,6 +449,7 @@ final class ChatStore: ObservableObject {
             conversations[conversationIndex].messages[messageIndex].state = .error
             conversations[conversationIndex].messages[messageIndex].errorText = Self.emptyResponseError
         }
+        conversations[conversationIndex].messages[messageIndex].isThoughtsStreaming = false
 
         touchConversation(at: conversationIndex)
     }
@@ -417,6 +458,7 @@ final class ChatStore: ObservableObject {
         streamTasks[conversationID]?.cancel()
         streamTasks[conversationID] = nil
         streamRequestIDs[conversationID] = nil
+        clearRawStreamingBuffers(for: conversationID)
 
         guard let conversationIndex = indexForConversation(conversationID),
               let assistantIndex = conversations[conversationIndex].messages.lastIndex(where: { $0.role == .assistant }) else {
@@ -425,6 +467,7 @@ final class ChatStore: ObservableObject {
         }
 
         conversations[conversationIndex].messages[assistantIndex].state = .error
+        conversations[conversationIndex].messages[assistantIndex].isThoughtsStreaming = false
         conversations[conversationIndex].messages[assistantIndex].errorText = message
         touchConversation(at: conversationIndex)
     }
@@ -435,6 +478,11 @@ final class ChatStore: ObservableObject {
         }
         startNewConversation()
         return conversations[0].id
+    }
+
+    private func clearRawStreamingBuffers(for conversationID: UUID) {
+        rawOutputBuffers[conversationID] = nil
+        rawThoughtBuffers[conversationID] = nil
     }
 
     private func canRegenerate(conversationID: UUID) -> Bool {
@@ -687,13 +735,8 @@ final class ChatStore: ObservableObject {
     }
 
     private func refreshServerMetadataNow() async {
-        do {
-            try await localServer.ensureRunning()
-            applyResolvedServerMetadata(fixedServerMetadata())
-            scheduleModelPrewarmIfNeeded()
-        } catch {
-            connectionState = .failed(friendlyMessage(for: error))
-        }
+        startLaunchPreparationIfNeeded()
+        await launchPreparationTask?.value
     }
 
     private func normalizedThoughts(_ text: String) -> String? {
@@ -732,14 +775,73 @@ final class ChatStore: ObservableObject {
         return false
     }
 
-    private func scheduleModelPrewarmIfNeeded() {
-        guard !didCompletePrewarm, prewarmTask == nil else { return }
+    private func startLaunchPreparationIfNeeded() {
+        guard launchPreparationTask == nil else { return }
+        connectionState = .checking
+        launchErrorMessage = nil
 
+        let request = modelWarmupRequest()
+        launchPreparationTask = Task { [weak self] in
+            guard let self else { return }
+
+            defer {
+                self.launchPreparationTask = nil
+            }
+
+            do {
+                var didAttemptRecovery = false
+
+                while true {
+                    do {
+                        try await self.localServer.ensureRunning()
+
+                        if !self.didCompletePrewarm {
+                            let stream = self.client.streamResponse(for: request)
+                            for try await _ in stream {
+                                try Task.checkCancellation()
+                            }
+                            self.didCompletePrewarm = true
+                        }
+
+                        self.applyResolvedServerMetadata(self.fixedServerMetadata())
+                        self.didPrepareLaunchModel = true
+                        self.updateLaunchReadiness()
+                        break
+                    } catch is CancellationError {
+                        throw CancellationError()
+                    } catch {
+                        guard !didAttemptRecovery,
+                              self.shouldRecoverFromServerError(error) || self.shouldRetryAfterEnsuringServer(error) else {
+                            throw error
+                        }
+
+                        didAttemptRecovery = true
+                        try await self.localServer.forceRestart()
+                    }
+                }
+            } catch is CancellationError {
+                return
+            } catch {
+                let message = self.friendlyMessage(for: error)
+                self.didPrepareLaunchModel = false
+                self.isLaunchReady = false
+                self.connectionState = .failed(message)
+                self.launchErrorMessage = message
+            }
+        }
+    }
+
+    private func updateLaunchReadiness() {
+        guard didLoadPersistedState, didPrepareLaunchModel else { return }
+        isLaunchReady = true
+    }
+
+    private func modelWarmupRequest() -> ResponsesAPIRequest {
         let warmupMessage = ChatMessage(
             role: .user,
             content: "Reply with exactly one word: ready."
         )
-        let request = ResponsesAPIRequest(
+        return ResponsesAPIRequest(
             requestID: UUID().uuidString,
             baseURL: pinnedBaseURL,
             apiKey: settings.apiKey.nonEmpty,
@@ -750,29 +852,6 @@ final class ChatStore: ObservableObject {
             instructions: nil,
             messages: [warmupMessage]
         )
-
-        prewarmTask = Task { [weak self] in
-            guard let self else { return }
-
-            defer {
-                self.prewarmTask = nil
-            }
-
-            do {
-                try await Task.sleep(for: .milliseconds(250))
-
-                let stream = self.client.streamResponse(for: request)
-                for try await _ in stream {
-                    try Task.checkCancellation()
-                }
-
-                self.didCompletePrewarm = true
-            } catch is CancellationError {
-                return
-            } catch {
-                return
-            }
-        }
     }
 }
 
@@ -808,6 +887,7 @@ private actor LocalModelServer {
     private let fileManager = FileManager.default
     private let baseURL = URL(string: AppSettings.defaultBaseURL)!
     private let serverURL: URL
+    private let runtimeRootURL: URL
     private let workingDirectoryURL: URL
     private let pythonURL: URL
     private let checkpointURL: URL
@@ -824,16 +904,36 @@ private actor LocalModelServer {
         self.session = session
         self.serverURL = baseURL.appending(path: "responses")
 
+        let appSupportURL = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? URL(fileURLWithPath: NSHomeDirectory()).appending(path: "Library/Application Support", directoryHint: .isDirectory)
+        self.runtimeRootURL = appSupportURL
+            .appending(path: "llocust", directoryHint: .isDirectory)
+            .appending(path: "runtime", directoryHint: .isDirectory)
+
         let sourceURL = URL(fileURLWithPath: sourceFilePath)
         let repositoryRoot = sourceURL
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             .deletingLastPathComponent()
+        let defaultWorkingDirectoryURL = repositoryRoot.appending(path: "gpt-oss", directoryHint: .isDirectory)
 
-        self.workingDirectoryURL = repositoryRoot.appending(path: "gpt-oss", directoryHint: .isDirectory)
+        let configuredRuntimeURL: URL
+        if let overridePath = ProcessInfo.processInfo.environment["LLOCUST_RUNTIME_ROOT"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !overridePath.isEmpty {
+            configuredRuntimeURL = URL(fileURLWithPath: overridePath, isDirectory: true)
+        } else {
+            configuredRuntimeURL = runtimeRootURL.appending(path: "gpt-oss", directoryHint: .isDirectory)
+        }
+
+        self.workingDirectoryURL = configuredRuntimeURL
         self.pythonURL = workingDirectoryURL.appending(path: ".venv/bin/python")
         self.checkpointURL = workingDirectoryURL.appending(path: "gpt-oss-20b/metal/metal/model.bin")
+
+        if !fileManager.fileExists(atPath: workingDirectoryURL.path),
+           !configuredRuntimeURL.standardizedFileURL.path.hasPrefix(defaultWorkingDirectoryURL.standardizedFileURL.path) {
+            NSLog("llocust runtime missing at %@", workingDirectoryURL.path)
+        }
     }
 
     func ensureRunning() async throws {
@@ -879,6 +979,10 @@ private actor LocalModelServer {
     }
 
     private func validateRuntime() throws {
+        guard fileManager.fileExists(atPath: workingDirectoryURL.path) else {
+            throw LocalModelServerError.missingRuntime(workingDirectoryURL.path)
+        }
+
         guard fileManager.isExecutableFile(atPath: pythonURL.path) else {
             throw LocalModelServerError.missingPython(pythonURL.path)
         }
@@ -1045,6 +1149,7 @@ private actor LocalModelServer {
 }
 
 private enum LocalModelServerError: LocalizedError {
+    case missingRuntime(String)
     case missingPython(String)
     case missingCheckpoint(String)
     case startupFailed(String?)
@@ -1052,6 +1157,8 @@ private enum LocalModelServerError: LocalizedError {
 
     var errorDescription: String? {
         switch self {
+        case .missingRuntime(let path):
+            return "The local oss 20b Metal runtime is not installed at \(path)."
         case .missingPython(let path):
             return "The local metal runtime is missing its Python executable at \(path)."
         case .missingCheckpoint(let path):

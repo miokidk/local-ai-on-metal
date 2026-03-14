@@ -8,6 +8,7 @@ struct MarkdownTextView: View {
 
     let markdown: String
     var style: Style = .standard
+    var fillsWidth: Bool = true
 
     private var blocks: [MarkdownBlock] {
         MarkdownBlock.parse(from: markdown)
@@ -32,7 +33,7 @@ struct MarkdownTextView: View {
                             }
                         }
                     }
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .modifier(FillWidthModifier(isEnabled: fillsWidth))
                 case .orderedList(let items):
                     VStack(alignment: .leading, spacing: 8) {
                         ForEach(Array(items.enumerated()), id: \.offset) { index, item in
@@ -44,7 +45,7 @@ struct MarkdownTextView: View {
                             }
                         }
                     }
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .modifier(FillWidthModifier(isEnabled: fillsWidth))
                 case .quote(let text):
                     HStack(alignment: .top, spacing: 10) {
                         RoundedRectangle(cornerRadius: 999, style: .continuous)
@@ -80,7 +81,7 @@ struct MarkdownTextView: View {
                 }
             }
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
+        .modifier(FillWidthModifier(isEnabled: fillsWidth))
     }
 
     @ViewBuilder
@@ -97,14 +98,14 @@ struct MarkdownTextView: View {
                 .foregroundStyle(primaryForegroundStyle)
                 .textSelection(.enabled)
                 .fixedSize(horizontal: false, vertical: true)
-                .frame(maxWidth: .infinity, alignment: .leading)
+                .modifier(FillWidthModifier(isEnabled: fillsWidth))
         } else {
             Text(text)
                 .font(font)
                 .foregroundStyle(primaryForegroundStyle)
                 .textSelection(.enabled)
                 .fixedSize(horizontal: false, vertical: true)
-                .frame(maxWidth: .infinity, alignment: .leading)
+                .modifier(FillWidthModifier(isEnabled: fillsWidth))
         }
     }
 
@@ -147,6 +148,18 @@ struct MarkdownTextView: View {
 
     private var secondaryForegroundStyle: Color {
         style == .subdued ? Color.secondary.opacity(0.68) : Color.secondary
+    }
+}
+
+private struct FillWidthModifier: ViewModifier {
+    let isEnabled: Bool
+
+    func body(content: Content) -> some View {
+        if isEnabled {
+            content.frame(maxWidth: .infinity, alignment: .leading)
+        } else {
+            content
+        }
     }
 }
 

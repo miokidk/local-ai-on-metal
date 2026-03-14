@@ -15,6 +15,7 @@
 		A00100010000000000000006 /* ResponsesPayloadParser.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00200010000000000000006 /* ResponsesPayloadParser.swift */; };
 		A00100010000000000000007 /* ResponsesAPIClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00200010000000000000007 /* ResponsesAPIClient.swift */; };
 		A00100010000000000000008 /* ChatStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00200010000000000000008 /* ChatStore.swift */; };
+		A00100010000000000000015 /* ModelOutputSanitizer.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00200010000000000000015 /* ModelOutputSanitizer.swift */; };
 		A00100010000000000000009 /* ChatRootView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00200010000000000000009 /* ChatRootView.swift */; };
 		A0010001000000000000000A /* ConversationDetailView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A0020001000000000000000A /* ConversationDetailView.swift */; };
 		A0010001000000000000000B /* MessageComposerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A0020001000000000000000B /* MessageComposerView.swift */; };
@@ -37,6 +38,7 @@
 		A00200010000000000000006 /* ResponsesPayloadParser.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResponsesPayloadParser.swift; sourceTree = "<group>"; };
 		A00200010000000000000007 /* ResponsesAPIClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResponsesAPIClient.swift; sourceTree = "<group>"; };
 		A00200010000000000000008 /* ChatStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatStore.swift; sourceTree = "<group>"; };
+		A00200010000000000000015 /* ModelOutputSanitizer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelOutputSanitizer.swift; sourceTree = "<group>"; };
 		A00200010000000000000009 /* ChatRootView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatRootView.swift; sourceTree = "<group>"; };
 		A0020001000000000000000A /* ConversationDetailView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConversationDetailView.swift; sourceTree = "<group>"; };
 		A0020001000000000000000B /* MessageComposerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MessageComposerView.swift; sourceTree = "<group>"; };
@@ -107,6 +109,7 @@
 			children = (
 				A00200010000000000000006 /* ResponsesPayloadParser.swift */,
 				A00200010000000000000007 /* ResponsesAPIClient.swift */,
+				A00200010000000000000015 /* ModelOutputSanitizer.swift */,
 			);
 			path = Networking;
 			sourceTree = "<group>";
@@ -253,6 +256,7 @@
 				A00100010000000000000006 /* ResponsesPayloadParser.swift in Sources */,
 				A00100010000000000000007 /* ResponsesAPIClient.swift in Sources */,
 				A00100010000000000000008 /* ChatStore.swift in Sources */,
+				A00100010000000000000015 /* ModelOutputSanitizer.swift in Sources */,
 				A00100010000000000000009 /* ChatRootView.swift in Sources */,
 				A0010001000000000000000A /* ConversationDetailView.swift in Sources */,
 				A0010001000000000000000B /* MessageComposerView.swift in Sources */,

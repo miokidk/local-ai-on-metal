@@ -19,8 +19,8 @@ enum ResponsesPayloadParser {
 
     static func parseResponse(jsonObject: Any) -> ParsedResponsePayload {
         let responseObject = rootResponseObject(from: jsonObject)
-        let outputText = assistantOutputText(in: responseObject)
-        let thoughts = normalize(reasoningText(in: responseObject))
+        let outputText = ModelOutputSanitizer.sanitize(assistantOutputText(in: responseObject))
+        let thoughts = normalize(ModelOutputSanitizer.sanitize(reasoningText(in: responseObject)))
         return ParsedResponsePayload(outputText: outputText, thoughts: thoughts)
     }
 
@@ -38,9 +38,13 @@ enum ResponsesPayloadParser {
         case "response.output_text.delta":
             return stringValue(forKey: "delta", in: dictionary).nonEmpty.map { [.outputDelta($0)] } ?? []
         case "response.reasoning_text.done":
-            return stringValue(forKey: "text", in: dictionary).nonEmpty.map { [.completed(finalText: nil, thoughts: $0)] } ?? []
+            return stringValue(forKey: "text", in: dictionary).nonEmpty.map {
+                [.completed(finalText: nil, thoughts: ModelOutputSanitizer.sanitize($0))]
+            } ?? []
         case "response.output_text.done":
-            return stringValue(forKey: "text", in: dictionary).nonEmpty.map { [.completed(finalText: $0, thoughts: nil)] } ?? []
+            return stringValue(forKey: "text", in: dictionary).nonEmpty.map {
+                [.completed(finalText: ModelOutputSanitizer.sanitize($0), thoughts: nil)]
+            } ?? []
         case "response.completed":
             let parsed = parseResponse(jsonObject: dictionary["response"] ?? dictionary)
             return [.completed(finalText: normalize(parsed.outputText), thoughts: parsed.thoughts)]

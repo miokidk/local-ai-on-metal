@@ -50,6 +50,7 @@ struct ChatMessage: Identifiable, Codable, Hashable {
     var content: String
     var attachments: [ChatAttachment] = []
     var thoughts: String?
+    var isThoughtsStreaming: Bool = false
     var state: ChatMessageState = .complete
     var errorText: String?
 
@@ -84,6 +85,7 @@ struct ChatMessage: Identifiable, Codable, Hashable {
         case content
         case attachments
         case thoughts
+        case isThoughtsStreaming
         case state
         case errorText
     }
@@ -95,6 +97,7 @@ struct ChatMessage: Identifiable, Codable, Hashable {
         content: String,
         attachments: [ChatAttachment] = [],
         thoughts: String? = nil,
+        isThoughtsStreaming: Bool = false,
         state: ChatMessageState = .complete,
         errorText: String? = nil
     ) {
@@ -104,6 +107,7 @@ struct ChatMessage: Identifiable, Codable, Hashable {
         self.content = content
         self.attachments = attachments
         self.thoughts = thoughts
+        self.isThoughtsStreaming = isThoughtsStreaming
         self.state = state
         self.errorText = errorText
     }
@@ -116,6 +120,7 @@ struct ChatMessage: Identifiable, Codable, Hashable {
         content = try container.decodeIfPresent(String.self, forKey: .content) ?? ""
         attachments = try container.decodeIfPresent([ChatAttachment].self, forKey: .attachments) ?? []
         thoughts = try container.decodeIfPresent(String.self, forKey: .thoughts)
+        isThoughtsStreaming = try container.decodeIfPresent(Bool.self, forKey: .isThoughtsStreaming) ?? false
         state = try container.decodeIfPresent(ChatMessageState.self, forKey: .state) ?? .complete
         errorText = try container.decodeIfPresent(String.self, forKey: .errorText)
     }

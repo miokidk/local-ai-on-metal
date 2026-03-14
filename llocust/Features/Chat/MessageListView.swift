@@ -21,57 +21,60 @@ struct MessageListView: View {
     }
 
     var body: some View {
-        ScrollViewReader { proxy in
-            ScrollView {
-                LazyVStack(spacing: 24) {
-                    ForEach(Array(conversation.messages.enumerated()), id: \.element.id) { index, message in
-                        MessageBubbleView(
-                            message: message,
-                            isLastAssistantMessage: index == conversation.messages.indices.last && message.role == .assistant,
-                            autoShowThoughts: autoShowThoughts,
-                            onCopy: {
-                                var segments: [String] = []
+        GeometryReader { geometry in
+            ScrollViewReader { proxy in
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 24) {
+                        ForEach(Array(conversation.messages.enumerated()), id: \.element.id) { index, message in
+                            MessageBubbleView(
+                                message: message,
+                                isLastAssistantMessage: index == conversation.messages.indices.last && message.role == .assistant,
+                                autoShowThoughts: autoShowThoughts,
+                                onCopy: {
+                                    var segments: [String] = []
 
-                                if let thoughts = message.thoughts?.trimmingCharacters(in: .whitespacesAndNewlines), !thoughts.isEmpty {
-                                    segments.append(thoughts)
-                                }
+                                    if let thoughts = message.thoughts?.trimmingCharacters(in: .whitespacesAndNewlines), !thoughts.isEmpty {
+                                        segments.append(thoughts)
+                                    }
 
-                                if !message.trimmedContent.isEmpty {
-                                    segments.append(message.content)
-                                }
+                                    if !message.trimmedContent.isEmpty {
+                                        segments.append(message.content)
+                                    }
 
-                                segments.append(contentsOf: message.attachments.map(\.modelInputText))
-                                let combined = segments.joined(separator: "\n\n")
-                                onCopy(combined)
-                            },
-                            onRegenerate: onRegenerate
-                        )
+                                    segments.append(contentsOf: message.attachments.map(\.modelInputText))
+                                    let combined = segments.joined(separator: "\n\n")
+                                    onCopy(combined)
+                                },
+                                onRegenerate: onRegenerate
+                            )
+                        }
+
+                        Color.clear
+                            .frame(height: 1)
+                            .id("message-bottom")
                     }
-
-                    Color.clear
-                        .frame(height: 1)
-                        .id("message-bottom")
+                    .frame(width: max(geometry.size.width - 48, 0), alignment: .leading)
+                    .padding(.horizontal, 24)
+                    .padding(.vertical, 32)
+                    .background(
+                        ScrollViewOffsetObserver { isNearBottom in
+                            userIsNearBottom = isNearBottom
+                        }
+                        .frame(width: 0, height: 0)
+                    )
                 }
-                .padding(.horizontal, 24)
-                .padding(.vertical, 32)
-                .background(
-                    ScrollViewOffsetObserver { isNearBottom in
-                        userIsNearBottom = isNearBottom
-                    }
-                    .frame(width: 0, height: 0)
-                )
-            }
-            .background(Color(nsColor: .windowBackgroundColor))
-            .onAppear {
-                scrollToBottom(proxy, animated: false)
-            }
-            .onChange(of: conversation.id) {
-                userIsNearBottom = true
-                scrollToBottom(proxy, animated: false)
-            }
-            .onChange(of: scrollTrigger) {
-                guard userIsNearBottom else { return }
-                scrollToBottom(proxy, animated: true)
+                .background(Color(nsColor: .windowBackgroundColor))
+                .onAppear {
+                    scrollToBottom(proxy, animated: false)
+                }
+                .onChange(of: conversation.id) {
+                    userIsNearBottom = true
+                    scrollToBottom(proxy, animated: false)
+                }
+                .onChange(of: scrollTrigger) {
+                    guard userIsNearBottom else { return }
+                    scrollToBottom(proxy, animated: true)
+                }
             }
         }
     }
@@ -98,68 +101,25 @@ private struct MessageBubbleView: View {
 
     @State private var isHovering = false
 
+    private var trimmedThoughts: String? {
+        message.thoughts?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+    }
+
+    private var shouldShowThoughtsDisclosure: Bool {
+        message.role == .assistant && (message.isThoughtsStreaming || trimmedThoughts != nil)
+    }
+
     var body: some View {
         VStack(alignment: message.role == .user ? .trailing : .leading, spacing: 8) {
-            HStack {
-                if message.role == .user { Spacer(minLength: 120) }
-
-                VStack(alignment: .leading, spacing: 10) {
-                    if let thoughts = message.thoughts?.trimmingCharacters(in: .whitespacesAndNewlines), !thoughts.isEmpty {
-                        ThoughtsDisclosureView(
-                            thoughts: thoughts,
-                            startsExpanded: autoShowThoughts
-                        )
-                    }
-
-                    if !message.content.isEmpty {
-                        MarkdownTextView(markdown: message.content)
-                    } else if message.role == .assistant && message.state == .streaming {
-                        Text("Thinking…")
-                            .font(.system(size: 14))
-                            .foregroundStyle(.secondary)
-                    }
-
-                    if !message.attachments.isEmpty {
-                        AttachmentListView(attachments: message.attachments)
-                    }
-
-                    if let errorText = message.errorText {
-                        Label(errorText, systemImage: "exclamationmark.triangle.fill")
-                            .font(.system(size: 13, weight: .medium))
-                            .foregroundStyle(Color.red.opacity(0.9))
-                            .padding(10)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .background(
-                                RoundedRectangle(cornerRadius: 14, style: .continuous)
-                                    .fill(Color.red.opacity(0.08))
-                            )
-                    }
-                }
-                .padding(.horizontal, 16)
-                .padding(.vertical, 14)
-                .frame(maxWidth: 760, alignment: .leading)
-                .background(bubbleBackground)
-                .overlay(alignment: .topTrailing) {
-                    if isHovering {
-                        HStack(spacing: 6) {
-                            BubbleActionButton(systemImage: "doc.on.doc", action: onCopy)
-                            if isLastAssistantMessage && message.role == .assistant && message.state != .streaming {
-                                BubbleActionButton(systemImage: "arrow.clockwise", action: onRegenerate)
-                            }
-                        }
-                        .padding(8)
-                    }
-                }
-                .onHover { isHovering = $0 }
-
-                if message.role == .assistant { Spacer(minLength: 120) }
-            }
+            messageRow
 
             Text(message.createdAt.formatted(date: .omitted, time: .shortened))
                 .font(.system(size: 11, weight: .medium))
                 .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: message.role == .user ? .trailing : .leading)
                 .padding(message.role == .user ? .trailing : .leading, 6)
         }
+        .frame(maxWidth: .infinity, alignment: message.role == .user ? .trailing : .leading)
         .contextMenu {
             Button("Copy") {
                 onCopy()
@@ -174,14 +134,83 @@ private struct MessageBubbleView: View {
     }
 
     @ViewBuilder
+    private var messageRow: some View {
+        if message.role == .user {
+            HStack {
+                Spacer(minLength: 0)
+                messageCard
+                    .frame(maxWidth: 620, alignment: .trailing)
+            }
+            .frame(maxWidth: .infinity, alignment: .trailing)
+        } else {
+            messageCard
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    private var messageCard: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            if shouldShowThoughtsDisclosure {
+                ThoughtsDisclosureView(
+                    thoughts: trimmedThoughts,
+                    isStreaming: message.isThoughtsStreaming,
+                    startsExpanded: autoShowThoughts
+                )
+            }
+
+            if !message.content.isEmpty {
+                MarkdownTextView(markdown: message.content, fillsWidth: message.role != .user)
+            }
+
+            if !message.attachments.isEmpty {
+                AttachmentListView(attachments: message.attachments)
+            }
+
+            if let errorText = message.errorText {
+                Label(errorText, systemImage: "exclamationmark.triangle.fill")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(Color.red.opacity(0.9))
+                    .padding(10)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(
+                        RoundedRectangle(cornerRadius: 14, style: .continuous)
+                            .fill(Color.red.opacity(0.08))
+                    )
+            }
+        }
+        .padding(.horizontal, message.role == .user ? 16 : 0)
+        .padding(.vertical, message.role == .user ? 14 : 0)
+        .background(bubbleBackground)
+        .overlay(alignment: .topTrailing) {
+            if isHovering {
+                HStack(spacing: 6) {
+                    BubbleActionButton(systemImage: "doc.on.doc", action: onCopy)
+                    if isLastAssistantMessage && message.role == .assistant && message.state != .streaming {
+                        BubbleActionButton(systemImage: "arrow.clockwise", action: onRegenerate)
+                    }
+                }
+                .padding(message.role == .user ? 8 : 0)
+            }
+        }
+        .contentShape(Rectangle())
+        .onHover { isHovering = $0 }
+    }
+
+    @ViewBuilder
     private var bubbleBackground: some View {
         if message.role == .user {
             RoundedRectangle(cornerRadius: 22, style: .continuous)
-                .fill(Color(nsColor: .controlBackgroundColor))
+                .fill(Color.accentColor.opacity(0.14))
         } else {
             RoundedRectangle(cornerRadius: 22, style: .continuous)
                 .fill(Color.clear)
         }
+    }
+}
+
+private extension String {
+    var nonEmpty: String? {
+        isEmpty ? nil : self
     }
 }
 
