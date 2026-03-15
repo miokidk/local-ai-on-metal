@@ -41,16 +41,6 @@ struct SidebarView: View {
                     .help("Settings")
                     .disabled(suppressButtonInteractions)
                 }
-
-                ToolbarItem(placement: .primaryAction) {
-                    Button {
-                        store.startNewConversation()
-                    } label: {
-                        Image(systemName: "square.and.pencil")
-                    }
-                    .help("New Chat")
-                    .disabled(suppressButtonInteractions)
-                }
             }
         }
         .frame(minWidth: 230)

@@ -8,6 +8,11 @@ final class ChatStore: ObservableObject {
     private static let maxAttachmentFileSize = 1_000_000
     private static let maxAttachmentCharacterCount = 120_000
     private static let maxDraftAttachmentCharacterCount = 360_000
+    private static let compactionSummaryCharacterLimit = 10_000
+    private static let compactionRequestMessageBudget = 24_000
+    private static let compactionRequestOutputTokens = 900
+    private static let minimumMessagesToCompact = 1
+    private static let minimumRecentMessagesToKeep = 2
 
     enum ConnectionState: Equatable {
         case idle
@@ -26,6 +31,7 @@ final class ChatStore: ObservableObject {
     @Published private(set) var connectionState: ConnectionState = .idle
     @Published private(set) var isLaunchReady = false
     @Published private(set) var launchErrorMessage: String?
+    @Published private(set) var contextCompactionStatus: [UUID: String] = [:]
     @Published var settings: AppSettings {
         didSet {
             persistSettings()
@@ -88,6 +94,11 @@ final class ChatStore: ObservableObject {
     var canRegenerateSelectedConversation: Bool {
         guard let conversation = selectedConversation else { return false }
         return canRegenerate(conversationID: conversation.id)
+    }
+
+    func contextCompactionMessage(for conversationID: UUID?) -> String? {
+        guard let conversationID else { return nil }
+        return contextCompactionStatus[conversationID]
     }
 
     func loadPersistedState() async {
@@ -317,20 +328,6 @@ final class ChatStore: ObservableObject {
         rawThoughtBuffers[conversationID] = ""
         touchConversation(at: conversationIndex)
 
-        let history = conversations[conversationIndex].messages.dropLast().filter { $0.hasVisibleContent }
-        let requestID = UUID().uuidString
-        let request = ResponsesAPIRequest(
-            requestID: requestID,
-            baseURL: pinnedBaseURL,
-            apiKey: settings.apiKey.nonEmpty,
-            model: AppSettings.fixedModelIdentifier,
-            reasoningEffort: settings.selectedReasoningEffort,
-            repeatPenalty: settings.repeatPenalty,
-            maxOutputTokens: nil,
-            instructions: settings.trimmedSystemInstructions,
-            messages: Array(history)
-        )
-
         let task = Task { [weak self] in
             guard let self else { return }
             let requestedBaseURL = AppSettings.defaultBaseURL
@@ -344,7 +341,12 @@ final class ChatStore: ObservableObject {
                 var didAttemptRecovery = false
 
                 while true {
+                    try Task.checkCancellation()
+                    let request = try self.makeAssistantRequest(for: conversationID)
+                    self.streamRequestIDs[conversationID] = request.requestID
+
                     do {
+                        self.clearContextCompactionStatus(for: conversationID)
                         self.applyResolvedServerMetadata(self.fixedServerMetadata())
                         let stream = self.client.streamResponse(for: request)
                         for try await event in stream {
@@ -355,6 +357,17 @@ final class ChatStore: ObservableObject {
                     } catch is CancellationError {
                         throw CancellationError()
                     } catch {
+                        self.streamRequestIDs[conversationID] = nil
+
+                        if try await self.compactConversationContextIfNeeded(
+                            for: conversationID,
+                            triggeredBy: error
+                        ) {
+                            didAttemptEnsureRunning = false
+                            didAttemptRecovery = false
+                            continue
+                        }
+
                         if !didAttemptEnsureRunning, self.shouldRetryAfterEnsuringServer(error) {
                             didAttemptEnsureRunning = true
                             self.connectionState = .checking
@@ -374,10 +387,13 @@ final class ChatStore: ObservableObject {
                     }
                 }
 
+                self.clearContextCompactionStatus(for: conversationID)
                 self.finishStreaming(in: conversationID)
             } catch is CancellationError {
+                self.clearContextCompactionStatus(for: conversationID)
                 self.finishStreaming(in: conversationID, preservePartialResult: true)
             } catch {
+                self.clearContextCompactionStatus(for: conversationID)
                 let message = self.friendlyMessage(for: error, requestedBaseURL: requestedBaseURL)
                 self.markAssistantError(message, in: conversationID)
                 self.connectionState = .failed(message)
@@ -385,7 +401,242 @@ final class ChatStore: ObservableObject {
         }
 
         streamTasks[conversationID] = task
-        streamRequestIDs[conversationID] = requestID
+    }
+
+    private func makeAssistantRequest(for conversationID: UUID) throws -> ResponsesAPIRequest {
+        guard let conversationIndex = indexForConversation(conversationID) else {
+            throw ResponsesAPIError.serverUnavailable("This conversation is no longer available.")
+        }
+
+        let conversation = conversations[conversationIndex]
+        let history = conversation.messages.dropLast().filter { $0.hasVisibleContent }
+        let preparedContext = preparedConversationContext(
+            from: Array(history),
+            conversation: conversation
+        )
+        let samplingProfile = samplingProfile(for: preparedContext.messages)
+
+        return ResponsesAPIRequest(
+            requestID: UUID().uuidString,
+            baseURL: pinnedBaseURL,
+            apiKey: settings.apiKey.nonEmpty,
+            model: AppSettings.fixedModelIdentifier,
+            reasoningEffort: settings.selectedReasoningEffort,
+            temperature: samplingProfile.temperature,
+            repeatPenalty: settings.repeatPenalty,
+            topP: samplingProfile.topP,
+            maxOutputTokens: nil,
+            instructions: preparedContext.instructions,
+            messages: preparedContext.messages
+        )
+    }
+
+    private func compactConversationContextIfNeeded(
+        for conversationID: UUID,
+        triggeredBy error: Error
+    ) async throws -> Bool {
+        guard shouldCompactContext(for: error), settings.usesConversationMemory else {
+            return false
+        }
+
+        var characterBudget = Self.compactionRequestMessageBudget
+
+        while characterBudget >= 4_000 {
+            try Task.checkCancellation()
+
+            guard let plan = makeCompactionPlan(
+                for: conversationID,
+                characterBudget: characterBudget
+            ) else {
+                clearContextCompactionStatus(for: conversationID)
+                return false
+            }
+
+            setContextCompactionStatus(
+                "Compacting older context to keep this conversation going…",
+                for: conversationID
+            )
+
+            do {
+                let response = try await client.completeResponse(for: plan.request)
+                try Task.checkCancellation()
+
+                guard let summary = normalizedCompactionSummary(response.outputText) else {
+                    throw ResponsesAPIError.serverUnavailable("The context compactor returned an empty summary.")
+                }
+
+                applyCompactionSummary(
+                    summary,
+                    compactedMessageCount: plan.compactedMessageCount,
+                    to: conversationID
+                )
+
+                clearContextCompactionStatus(for: conversationID)
+                return true
+            } catch is CancellationError {
+                clearContextCompactionStatus(for: conversationID)
+                throw CancellationError()
+            } catch let compactionError {
+                if shouldCompactContext(for: compactionError) {
+                    characterBudget /= 2
+                    continue
+                }
+
+                clearContextCompactionStatus(for: conversationID)
+                throw compactionError
+            }
+        }
+
+        clearContextCompactionStatus(for: conversationID)
+        return false
+    }
+
+    private func makeCompactionPlan(
+        for conversationID: UUID,
+        characterBudget: Int
+    ) -> ConversationCompactionPlan? {
+        guard let conversationIndex = indexForConversation(conversationID) else {
+            return nil
+        }
+
+        let conversation = conversations[conversationIndex]
+        let history = conversation.messages.filter { $0.hasVisibleContent }
+        let digest = effectiveMemoryDigest(for: conversation, historyCount: history.count)
+        let compactedCount = digest?.compactedMessageCount ?? 0
+        let remainingMessages = Array(history.dropFirst(compactedCount))
+        let preferredKeepRecentCount = min(max(settings.recentContextMessageCount, 4), 20)
+        let keepRecentCount = min(
+            preferredKeepRecentCount,
+            max(Self.minimumRecentMessagesToKeep, remainingMessages.count - 1)
+        )
+
+        guard remainingMessages.count > keepRecentCount else {
+            return nil
+        }
+
+        let compactableMessages = Array(remainingMessages.dropLast(keepRecentCount))
+        guard !compactableMessages.isEmpty else {
+            return nil
+        }
+
+        var chunk: [ChatMessage] = []
+        var usedCharacters = 0
+
+        for message in compactableMessages {
+            let messageCost = max(message.approximateModelInputCharacterCount, 1)
+            if !chunk.isEmpty, usedCharacters + messageCost > characterBudget {
+                break
+            }
+
+            chunk.append(message)
+            usedCharacters += messageCost
+        }
+
+        if chunk.count < Self.minimumMessagesToCompact {
+            chunk = Array(compactableMessages.prefix(Self.minimumMessagesToCompact))
+        }
+
+        guard !chunk.isEmpty else {
+            return nil
+        }
+
+        let transcript = renderCompactionTranscript(chunk)
+        let existingSummary = digest?.summary.trimmingCharacters(in: .whitespacesAndNewlines)
+        let existingMemorySection: String
+        if let existingSummary, !existingSummary.isEmpty {
+            existingMemorySection = "Existing rolling memory:\n\(existingSummary)"
+        } else {
+            existingMemorySection = "Existing rolling memory: (none yet)"
+        }
+        let userPrompt = [
+            "Update the rolling memory for this conversation so future replies can continue with a fresh context window.",
+            existingMemorySection,
+            "New transcript slice to fold in:\n\(transcript)"
+        ].joined(separator: "\n\n")
+
+        let request = ResponsesAPIRequest(
+            requestID: UUID().uuidString,
+            baseURL: pinnedBaseURL,
+            apiKey: settings.apiKey.nonEmpty,
+            model: AppSettings.fixedModelIdentifier,
+            reasoningEffort: .low,
+            temperature: 0.35,
+            repeatPenalty: 0.1,
+            topP: 0.9,
+            maxOutputTokens: Self.compactionRequestOutputTokens,
+            instructions: compactionInstructions,
+            messages: [ChatMessage(role: .user, content: userPrompt)]
+        )
+
+        return ConversationCompactionPlan(
+            request: request,
+            compactedMessageCount: compactedCount + chunk.count
+        )
+    }
+
+    private func renderCompactionTranscript(_ messages: [ChatMessage]) -> String {
+        messages.enumerated().map { index, message in
+            var sections: [String] = ["\(index + 1). \(message.role == .user ? "User" : "Assistant")"]
+
+            if !message.trimmedContent.isEmpty {
+                sections.append(message.content)
+            }
+
+            if !message.attachments.isEmpty {
+                sections.append(contentsOf: message.attachments.map(\.modelInputText))
+            }
+
+            return sections.joined(separator: "\n")
+        }
+        .joined(separator: "\n\n---\n\n")
+    }
+
+    private func normalizedCompactionSummary(_ text: String) -> String? {
+        let normalized = ModelOutputSanitizer.sanitize(text)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard !normalized.isEmpty else {
+            return nil
+        }
+
+        return normalized.truncated(to: Self.compactionSummaryCharacterLimit)
+    }
+
+    private func applyCompactionSummary(
+        _ summary: String,
+        compactedMessageCount: Int,
+        to conversationID: UUID
+    ) {
+        guard let conversationIndex = indexForConversation(conversationID) else { return }
+
+        conversations[conversationIndex].memoryDigest = ConversationMemoryDigest(
+            summary: summary,
+            compactedMessageCount: compactedMessageCount,
+            updatedAt: Date()
+        )
+        touchConversation(at: conversationIndex)
+    }
+
+    private func setContextCompactionStatus(_ message: String, for conversationID: UUID) {
+        contextCompactionStatus[conversationID] = message
+    }
+
+    private func clearContextCompactionStatus(for conversationID: UUID) {
+        contextCompactionStatus[conversationID] = nil
+    }
+
+    private func shouldCompactContext(for error: Error) -> Bool {
+        guard case let ResponsesAPIError.server(status, message) = error else {
+            return false
+        }
+
+        guard status == 400 else {
+            return false
+        }
+
+        return message.localizedCaseInsensitiveContains("input is too long for the local model")
+            || message.localizedCaseInsensitiveContains("context window")
+            || message.localizedCaseInsensitiveContains("too long")
     }
 
     private func consume(_ event: ResponsesAPIStreamEvent, conversationID: UUID) {
@@ -515,6 +766,7 @@ final class ChatStore: ObservableObject {
 
     private func touchConversation(at index: Int) {
         guard conversations.indices.contains(index) else { return }
+        objectWillChange.send()
         conversations[index].updatedAt = Date()
 
         if index != 0 {
@@ -546,6 +798,14 @@ final class ChatStore: ObservableObject {
         let formatter = DateFormatter()
         formatter.dateStyle = .medium
         formatter.timeStyle = .short
+
+        if let memoryDigest = conversation.memoryDigest,
+           !memoryDigest.summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            lines.append("## Rolling Memory")
+            lines.append("")
+            lines.append(memoryDigest.summary)
+            lines.append("")
+        }
 
         for message in conversation.messages {
             let roleTitle = message.role == .user ? "User" : "Assistant"
@@ -836,6 +1096,217 @@ final class ChatStore: ObservableObject {
         isLaunchReady = true
     }
 
+    private var compactionInstructions: String {
+        """
+You are compacting a long-running chat into a rolling memory so the conversation can continue in a fresh context window.
+Return only the updated rolling memory in Markdown.
+Preserve durable facts, user preferences, decisions, file names, code constraints, promises, unfinished work, and open questions.
+Drop filler, duplicates, and wording that does not help future turns.
+Use short sections named `Preferences`, `Facts`, `In Progress`, and `Open Loops`.
+Stay concise but specific.
+"""
+    }
+
+    private func preparedConversationContext(
+        from history: [ChatMessage],
+        conversation: Conversation
+    ) -> PreparedConversationContext {
+        let baseInstructions = settings.composedInstructions
+        guard settings.usesConversationMemory else {
+            return PreparedConversationContext(instructions: baseInstructions, messages: history)
+        }
+
+        let memoryDigest = effectiveMemoryDigest(for: conversation, historyCount: history.count)
+        if let memoryDigest {
+            let activeHistory = Array(history.dropFirst(memoryDigest.compactedMessageCount))
+            return preparedConversationContext(
+                fromActiveHistory: activeHistory,
+                baseInstructions: baseInstructions,
+                rollingMemory: memoryDigest.summary
+            )
+        }
+
+        let recentCount = min(max(settings.recentContextMessageCount, 4), 20)
+        let totalCharacterCount = history.reduce(0) { $0 + $1.approximateModelInputCharacterCount }
+
+        guard history.count > recentCount + 4 || totalCharacterCount > 18_000 else {
+            return PreparedConversationContext(instructions: baseInstructions, messages: history)
+        }
+
+        let anchorCount = min(2, max(history.count - recentCount, 1))
+        let recentStartIndex = max(anchorCount, history.count - recentCount)
+        guard recentStartIndex > anchorCount else {
+            return PreparedConversationContext(instructions: baseInstructions, messages: history)
+        }
+
+        let anchorMessages = Array(history.prefix(anchorCount))
+        let recentMessages = Array(history.suffix(from: recentStartIndex))
+        let earlierMessages = Array(history[anchorCount..<recentStartIndex])
+
+        guard let memoryBlock = compressedConversationMemory(from: earlierMessages) else {
+            return PreparedConversationContext(instructions: baseInstructions, messages: history)
+        }
+
+        let instructions = [
+            baseInstructions,
+            """
+Long-chat memory:
+\(memoryBlock)
+
+Treat the long-chat memory as compressed background context. Prefer the latest user turns whenever they conflict with older summarized context.
+"""
+        ].joined(separator: "\n\n")
+
+        var packedMessages = anchorMessages
+        packedMessages.append(contentsOf: recentMessages)
+
+        return PreparedConversationContext(
+            instructions: instructions,
+            messages: deduplicatedMessages(packedMessages)
+        )
+    }
+
+    private func preparedConversationContext(
+        fromActiveHistory history: [ChatMessage],
+        baseInstructions: String,
+        rollingMemory: String
+    ) -> PreparedConversationContext {
+        let recentCount = min(max(settings.recentContextMessageCount, 4), 20)
+        let totalCharacterCount = history.reduce(0) { $0 + $1.approximateModelInputCharacterCount }
+
+        var instructionParts = [
+            baseInstructions,
+            """
+Rolling conversation memory:
+\(rollingMemory)
+
+Treat the rolling conversation memory as authoritative background context for earlier turns. Prefer the latest verbatim turns whenever they conflict with older summarized context.
+"""
+        ]
+
+        guard history.count > recentCount + 4 || totalCharacterCount > 18_000 else {
+            return PreparedConversationContext(
+                instructions: instructionParts.joined(separator: "\n\n"),
+                messages: history
+            )
+        }
+
+        let recentMessages = Array(history.suffix(recentCount))
+        let earlierMessages = Array(history.dropLast(min(recentCount, history.count)))
+
+        if let memoryBlock = compressedConversationMemory(from: earlierMessages) {
+            instructionParts.append(
+                """
+Recent overflow memory:
+\(memoryBlock)
+
+Use this as supporting context for turns that happened after the rolling memory but before the recent verbatim transcript.
+"""
+            )
+        }
+
+        return PreparedConversationContext(
+            instructions: instructionParts.joined(separator: "\n\n"),
+            messages: deduplicatedMessages(recentMessages)
+        )
+    }
+
+    private func effectiveMemoryDigest(
+        for conversation: Conversation,
+        historyCount: Int
+    ) -> ConversationMemoryDigest? {
+        guard var digest = conversation.memoryDigest else {
+            return nil
+        }
+
+        digest.compactedMessageCount = min(max(digest.compactedMessageCount, 0), historyCount)
+        guard !digest.summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              digest.compactedMessageCount > 0 else {
+            return nil
+        }
+
+        return digest
+    }
+
+    private func compressedConversationMemory(from messages: [ChatMessage]) -> String? {
+        let maxMemoryCharacters = 12_000
+        let perMessageLimit = 320
+        var lines = ["Earlier conversation digest from older turns:"]
+        var usedCharacters = lines[0].count
+        var itemIndex = 1
+
+        for message in messages {
+            let excerpt = message.contextDigestExcerpt(limit: perMessageLimit)
+            guard !excerpt.isEmpty else { continue }
+
+            let roleTitle = message.role == .user ? "User" : "Assistant"
+            let line = "\(itemIndex). \(roleTitle): \(excerpt)"
+            let projectedLength = usedCharacters + line.count + 1
+
+            guard projectedLength <= maxMemoryCharacters else {
+                let overflowNotice = "... Older turns were compressed further to stay within budget."
+                if usedCharacters + overflowNotice.count + 1 <= maxMemoryCharacters {
+                    lines.append(overflowNotice)
+                }
+                break
+            }
+
+            lines.append(line)
+            usedCharacters = projectedLength
+            itemIndex += 1
+        }
+
+        return lines.count > 1 ? lines.joined(separator: "\n") : nil
+    }
+
+    private func deduplicatedMessages(_ messages: [ChatMessage]) -> [ChatMessage] {
+        var seen = Set<UUID>()
+        return messages.filter { seen.insert($0.id).inserted }
+    }
+
+    private func samplingProfile(for messages: [ChatMessage]) -> SamplingProfile {
+        var temperature = settings.baseTemperature
+        var topP = settings.topP
+
+        switch settings.selectedReasoningEffort {
+        case .low:
+            break
+        case .medium:
+            temperature -= 0.03
+            topP -= 0.01
+        case .high:
+            temperature -= 0.07
+            topP -= 0.03
+        }
+
+        let totalCharacters = messages.reduce(0) { $0 + $1.approximateModelInputCharacterCount }
+        let attachmentCount = messages.reduce(0) { $0 + $1.attachments.count }
+
+        if messages.count >= 10 || totalCharacters >= 12_000 {
+            temperature -= 0.04
+            topP -= 0.02
+        }
+
+        if messages.count >= 18 || totalCharacters >= 22_000 {
+            temperature -= 0.04
+            topP -= 0.02
+        }
+
+        if attachmentCount > 0 {
+            temperature -= 0.03
+            topP -= 0.02
+        }
+
+        if settings.usesConversationMemory && messages.count >= settings.recentContextMessageCount {
+            temperature -= 0.02
+        }
+
+        return SamplingProfile(
+            temperature: min(max(temperature, 0.7), 1.1),
+            topP: min(max(topP, 0.86), 0.98)
+        )
+    }
+
     private func modelWarmupRequest() -> ResponsesAPIRequest {
         let warmupMessage = ChatMessage(
             role: .user,
@@ -847,7 +1318,9 @@ final class ChatStore: ObservableObject {
             apiKey: settings.apiKey.nonEmpty,
             model: AppSettings.fixedModelIdentifier,
             reasoningEffort: .low,
+            temperature: 0.8,
             repeatPenalty: 0,
+            topP: AppSettings.defaultTopP,
             maxOutputTokens: 1,
             instructions: nil,
             messages: [warmupMessage]
@@ -855,10 +1328,82 @@ final class ChatStore: ObservableObject {
     }
 }
 
+private struct PreparedConversationContext {
+    let instructions: String
+    let messages: [ChatMessage]
+}
+
+private struct ConversationCompactionPlan {
+    let request: ResponsesAPIRequest
+    let compactedMessageCount: Int
+}
+
+private struct SamplingProfile {
+    let temperature: Double
+    let topP: Double
+}
+
+private extension ChatMessage {
+    var approximateModelInputCharacterCount: Int {
+        content.count + attachments.reduce(0) { $0 + $1.modelInputText.count }
+    }
+
+    func contextDigestExcerpt(limit: Int) -> String {
+        var parts: [String] = []
+        let text = trimmedContent.compactingWhitespace()
+
+        if !text.isEmpty {
+            parts.append(text)
+        }
+
+        let attachmentSummaries = attachments.prefix(2).map { $0.contextDigestExcerpt(limit: 180) }
+        parts.append(contentsOf: attachmentSummaries.filter { !$0.isEmpty })
+
+        if attachments.count > 2 {
+            parts.append("+\(attachments.count - 2) more attachments")
+        }
+
+        let combined = parts
+            .joined(separator: " | ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        return combined.truncated(to: limit)
+    }
+}
+
+private extension ChatAttachment {
+    func contextDigestExcerpt(limit: Int) -> String {
+        var summary = "Attachment \(fileName)"
+        let snippet = extractedText.compactingWhitespace().truncated(to: 160)
+
+        if !snippet.isEmpty {
+            summary += ": \(snippet)"
+        }
+
+        if wasTruncated {
+            summary += " [truncated]"
+        }
+
+        return summary.truncated(to: limit)
+    }
+}
+
 private extension String {
     var nonEmpty: String? {
         let trimmed = trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : self
+    }
+
+    func compactingWhitespace() -> String {
+        split(whereSeparator: \.isWhitespace).joined(separator: " ")
+    }
+
+    func truncated(to limit: Int) -> String {
+        guard limit > 0 else { return "" }
+        guard count > limit else { return self }
+
+        let cutoff = index(startIndex, offsetBy: max(limit - 1, 0))
+        return String(self[..<cutoff]).trimmingCharacters(in: .whitespacesAndNewlines) + "…"
     }
 }
 
@@ -883,6 +1428,9 @@ private enum AttachmentError: LocalizedError {
 }
 
 private actor LocalModelServer {
+    private static let modelReference = "gpt-oss:20b"
+    private static let inferenceBackend = "ollama"
+
     private let session: URLSession
     private let fileManager = FileManager.default
     private let baseURL = URL(string: AppSettings.defaultBaseURL)!
@@ -890,7 +1438,7 @@ private actor LocalModelServer {
     private let runtimeRootURL: URL
     private let workingDirectoryURL: URL
     private let pythonURL: URL
-    private let checkpointURL: URL
+    private let modelReference: String
 
     private var process: Process?
     private var outputPipe: Pipe?
@@ -922,13 +1470,15 @@ private actor LocalModelServer {
         if let overridePath = ProcessInfo.processInfo.environment["LLOCUST_RUNTIME_ROOT"]?.trimmingCharacters(in: .whitespacesAndNewlines),
            !overridePath.isEmpty {
             configuredRuntimeURL = URL(fileURLWithPath: overridePath, isDirectory: true)
+        } else if fileManager.isExecutableFile(atPath: defaultWorkingDirectoryURL.appending(path: ".venv/bin/python").path) {
+            configuredRuntimeURL = defaultWorkingDirectoryURL
         } else {
             configuredRuntimeURL = runtimeRootURL.appending(path: "gpt-oss", directoryHint: .isDirectory)
         }
 
         self.workingDirectoryURL = configuredRuntimeURL
         self.pythonURL = workingDirectoryURL.appending(path: ".venv/bin/python")
-        self.checkpointURL = workingDirectoryURL.appending(path: "gpt-oss-20b/metal/metal/model.bin")
+        self.modelReference = Self.modelReference
 
         if !fileManager.fileExists(atPath: workingDirectoryURL.path),
            !configuredRuntimeURL.standardizedFileURL.path.hasPrefix(defaultWorkingDirectoryURL.standardizedFileURL.path) {
@@ -987,8 +1537,8 @@ private actor LocalModelServer {
             throw LocalModelServerError.missingPython(pythonURL.path)
         }
 
-        guard fileManager.fileExists(atPath: checkpointURL.path) else {
-            throw LocalModelServerError.missingCheckpoint(checkpointURL.path)
+        if Self.inferenceBackend != "ollama" {
+            throw LocalModelServerError.missingCheckpoint(modelReference)
         }
     }
 
@@ -1005,11 +1555,11 @@ private actor LocalModelServer {
             "-m",
             "gpt_oss.responses_api.serve",
             "--checkpoint",
-            checkpointURL.path,
+            modelReference,
             "--port",
             "\(baseURL.port ?? 8412)",
             "--inference-backend",
-            "metal"
+            Self.inferenceBackend
         ]
 
         var environment = ProcessInfo.processInfo.environment
@@ -1017,18 +1567,10 @@ private actor LocalModelServer {
             "DYLD_INSERT_LIBRARIES",
             "__XPC_DYLD_INSERT_LIBRARIES",
             "__XCODE_BUILT_PRODUCTS_DIR_PATHS",
-            "MTL_DEBUG_LAYER",
-            "MTL_SHADER_VALIDATION",
-            "METAL_DEVICE_WRAPPER_TYPE",
-            "METAL_CAPTURE_ENABLED",
             "OS_ACTIVITY_DT_MODE"
         ]
         strippedEnvironmentKeys.forEach { environment.removeValue(forKey: $0) }
         environment["PYTHONUNBUFFERED"] = "1"
-        environment["MTL_DEBUG_LAYER"] = "0"
-        environment["MTL_SHADER_VALIDATION"] = "0"
-        environment["METAL_DEVICE_WRAPPER_TYPE"] = "0"
-        environment["METAL_CAPTURE_ENABLED"] = "0"
         process.environment = environment
         process.standardOutput = pipe
         process.standardError = pipe
@@ -1158,21 +1700,21 @@ private enum LocalModelServerError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .missingRuntime(let path):
-            return "The local oss 20b Metal runtime is not installed at \(path)."
+            return "The local oss 20b runtime is not installed at \(path)."
         case .missingPython(let path):
-            return "The local metal runtime is missing its Python executable at \(path)."
+            return "The local oss 20b runtime is missing its Python executable at \(path)."
         case .missingCheckpoint(let path):
-            return "The local oss 20b Metal checkpoint is missing at \(path)."
+            return "The local oss 20b Ollama model is unavailable: \(path)."
         case .startupFailed(let logs):
             if let logs, !logs.isEmpty {
-                return "The local oss 20b Metal server exited while starting.\n\n\(logs)"
+                return "The local oss 20b server exited while starting.\n\n\(logs)"
             }
-            return "The local oss 20b Metal server exited while starting."
+            return "The local oss 20b server exited while starting."
         case .startupTimedOut(let logs):
             if let logs, !logs.isEmpty {
-                return "The local oss 20b Metal server took too long to start.\n\n\(logs)"
+                return "The local oss 20b server took too long to start.\n\n\(logs)"
             }
-            return "The local oss 20b Metal server took too long to start."
+            return "The local oss 20b server took too long to start."
         }
     }
 }

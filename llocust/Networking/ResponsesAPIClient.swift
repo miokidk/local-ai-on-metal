@@ -26,7 +26,9 @@ struct ResponsesAPIRequest {
     let apiKey: String?
     let model: String
     let reasoningEffort: ReasoningEffort
+    let temperature: Double
     let repeatPenalty: Double
+    let topP: Double
     let maxOutputTokens: Int?
     let instructions: String?
     let messages: [ChatMessage]
@@ -48,6 +50,21 @@ final class ResponsesAPIClient {
 
     init(session: URLSession = .shared) {
         self.session = session
+    }
+
+    func completeResponse(for request: ResponsesAPIRequest) async throws -> ParsedResponsePayload {
+        let urlRequest = try makeURLRequest(for: request, streaming: false)
+        let data: Data
+        let response: URLResponse
+
+        do {
+            (data, response) = try await session.data(for: urlRequest)
+        } catch let error as URLError {
+            throw translated(urlError: error)
+        }
+
+        try validate(response: response, data: data)
+        return try ResponsesPayloadParser.parseResponse(data: data)
     }
 
     func streamResponse(for request: ResponsesAPIRequest) -> AsyncThrowingStream<ResponsesAPIStreamEvent, Error> {
@@ -228,7 +245,9 @@ final class ResponsesAPIClient {
             "model": request.model,
             "input": input,
             "stream": streaming,
+            "temperature": request.temperature,
             "frequency_penalty": request.repeatPenalty,
+            "top_p": request.topP,
             "reasoning": [
                 "effort": request.reasoningEffort.rawValue
             ]

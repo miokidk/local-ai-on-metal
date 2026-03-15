@@ -8,6 +8,7 @@ struct ConversationDetailView: View {
     var body: some View {
         VStack(spacing: 0) {
             content
+            contextCompactionBanner
             connectionBanner
             MessageComposerView(
                 text: $store.draftText,
@@ -27,6 +28,32 @@ struct ConversationDetailView: View {
             .padding(.bottom, 24)
         }
         .background(Color(nsColor: .windowBackgroundColor))
+        .toolbar {
+            ToolbarItemGroup(placement: .navigation) {
+                Button {
+                    store.startNewConversation()
+                } label: {
+                    Image(systemName: "square.and.pencil")
+                }
+                .help("New Chat")
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var contextCompactionBanner: some View {
+        if let message = store.contextCompactionMessage(for: conversation?.id) {
+            HStack(spacing: 10) {
+                ProgressView()
+                    .controlSize(.small)
+                Text(message)
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(.secondary)
+                Spacer()
+            }
+            .padding(.horizontal, 24)
+            .padding(.top, 10)
+        }
     }
 
     @ViewBuilder
@@ -38,7 +65,7 @@ struct ConversationDetailView: View {
             HStack(spacing: 10) {
                 ProgressView()
                     .controlSize(.small)
-                Text("Starting oss 20b Metal…")
+                Text("Starting oss 20b…")
                     .font(.system(size: 12, weight: .medium))
                     .foregroundStyle(.secondary)
                 Spacer()

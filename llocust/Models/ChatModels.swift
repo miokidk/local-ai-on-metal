@@ -126,6 +126,12 @@ struct ChatMessage: Identifiable, Codable, Hashable {
     }
 }
 
+struct ConversationMemoryDigest: Codable, Hashable {
+    var summary: String
+    var compactedMessageCount: Int
+    var updatedAt: Date = Date()
+}
+
 struct Conversation: Identifiable, Codable, Hashable {
     static let untitledName = "New Chat"
 
@@ -134,6 +140,7 @@ struct Conversation: Identifiable, Codable, Hashable {
     var createdAt: Date = Date()
     var updatedAt: Date = Date()
     var messages: [ChatMessage] = []
+    var memoryDigest: ConversationMemoryDigest?
 
     var previewText: String {
         let latestText = messages.last(where: { $0.hasVisibleContent })?.previewText ?? "No messages yet"

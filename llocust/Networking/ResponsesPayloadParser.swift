@@ -33,7 +33,7 @@ enum ResponsesPayloadParser {
         let loweredEvent = (eventName ?? eventType(in: dictionary) ?? "").lowercased()
 
         switch loweredEvent {
-        case "response.reasoning_text.delta", "response.reasoning_summary_text.delta":
+        case "response.reasoning_text.delta":
             return stringValue(forKey: "delta", in: dictionary).nonEmpty.map { [.thoughtsDelta($0)] } ?? []
         case "response.output_text.delta":
             return stringValue(forKey: "delta", in: dictionary).nonEmpty.map { [.outputDelta($0)] } ?? []
@@ -105,11 +105,6 @@ enum ResponsesPayloadParser {
                 }
             }
 
-            if let summary = item["summary"] as? [[String: Any]] {
-                for part in summary where (part["type"] as? String)?.lowercased() == "summary_text" {
-                    text += stringValue(forKey: "text", in: part)
-                }
-            }
         }
 
         return text

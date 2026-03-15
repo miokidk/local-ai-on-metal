@@ -25,18 +25,6 @@ struct ChatRootView: View {
                     guard width > 0 else { return }
                     sidebarWidth = width
                 }
-                .toolbar {
-                    if !isSidebarVisible {
-                        ToolbarItem(placement: .primaryAction) {
-                            Button {
-                                store.startNewConversation()
-                            } label: {
-                                Image(systemName: "square.and.pencil")
-                            }
-                            .help("New Chat")
-                        }
-                    }
-                }
             } else {
                 LaunchScreenView(
                     errorMessage: store.launchErrorMessage,
@@ -65,19 +53,19 @@ private struct UnifiedTitlebarOverlay: View {
     let sidebarWidth: CGFloat
 
     private let overlayHeight: CGFloat = 92
-    private let shieldOverlap: CGFloat = 10
+    private let detailOverlap: CGFloat = 14
 
     var body: some View {
         GeometryReader { geometry in
             let clampedSidebarWidth = min(max(sidebarWidth, 0), geometry.size.width)
-            let shieldWidth = min(clampedSidebarWidth + shieldOverlap, geometry.size.width)
+            let detailStartX = max(clampedSidebarWidth - detailOverlap, 0)
+            let detailWidth = max(geometry.size.width - detailStartX, 0)
 
             ZStack(alignment: .topLeading) {
-                TitlebarBlurSection()
-                TitlebarTintOverlay()
-
-                if shieldWidth > 0 {
-                    SidebarShield(width: shieldWidth)
+                if detailWidth > 0 {
+                    DetailTitlebarOverlay()
+                        .frame(width: detailWidth, height: overlayHeight, alignment: .topLeading)
+                        .offset(x: detailStartX)
                 }
 
                 HStack {
@@ -91,6 +79,18 @@ private struct UnifiedTitlebarOverlay: View {
         .frame(height: overlayHeight)
         .ignoresSafeArea(edges: .top)
         .allowsHitTesting(false)
+    }
+}
+
+private struct DetailTitlebarOverlay: View {
+    var body: some View {
+        ZStack {
+            TitlebarBlurSection()
+            TitlebarTintOverlay()
+        }
+        .mask {
+            DetailTitlebarMask()
+        }
     }
 }
 
@@ -112,6 +112,28 @@ private struct TitlebarTintOverlay: View {
 private struct TitlebarBlurSection: View {
     var body: some View {
         WindowBlurView(material: .titlebar)
+    }
+}
+
+private struct DetailTitlebarMask: View {
+    private let edgeFadeWidth: CGFloat = 12
+
+    var body: some View {
+        GeometryReader { geometry in
+            let fadeWidth = min(edgeFadeWidth, geometry.size.width)
+
+            HStack(spacing: 0) {
+                LinearGradient(
+                    colors: [.clear, .white],
+                    startPoint: .leading,
+                    endPoint: .trailing
+                )
+                .frame(width: fadeWidth)
+
+                Rectangle()
+                    .fill(.white)
+                    .frame(maxWidth: .infinity)
+            }
             .mask {
                 LinearGradient(
                     stops: [
@@ -124,25 +146,7 @@ private struct TitlebarBlurSection: View {
                     endPoint: .bottom
                 )
             }
-    }
-}
-
-private struct SidebarShield: View {
-    let width: CGFloat
-
-    var body: some View {
-        LinearGradient(
-            stops: [
-                .init(color: Color(nsColor: .windowBackgroundColor), location: 0),
-                .init(color: Color(nsColor: .windowBackgroundColor), location: 0.72),
-                .init(color: Color(nsColor: .windowBackgroundColor).opacity(0.92), location: 0.9),
-                .init(color: .clear, location: 1)
-            ],
-            startPoint: .leading,
-            endPoint: .trailing
-        )
-        .frame(width: width)
-        .frame(maxHeight: .infinity, alignment: .top)
+        }
     }
 }
 
@@ -220,7 +224,7 @@ private struct LaunchScreenView: View {
                 } else {
                     ProgressView()
                         .controlSize(.regular)
-                    Text("Starting oss 20b Metal…")
+                    Text("Starting oss 20b…")
                         .font(.system(size: 22, weight: .semibold))
                     Text("The app will open as soon as the model is warm and ready.")
                         .font(.system(size: 14, weight: .medium))
