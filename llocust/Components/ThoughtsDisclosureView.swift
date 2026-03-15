@@ -19,9 +19,17 @@ struct ThoughtsDisclosureView: View {
                     .padding(.top, 8)
             }
         } label: {
-            Text(isStreaming ? "Thinking..." : "Thoughts")
-                .font(.system(size: 12, weight: .medium))
-                .foregroundStyle(Color.secondary.opacity(0.78))
+            HStack(spacing: 0) {
+                Text(isStreaming ? "Thinking..." : "Thoughts")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(Color.secondary.opacity(0.78))
+
+                Spacer(minLength: 0)
+            }
+            .contentShape(Rectangle())
+            .onTapGesture {
+                isExpanded.toggle()
+            }
         }
         .onAppear {
             isExpanded = startsExpanded

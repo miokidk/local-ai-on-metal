@@ -41,10 +41,26 @@ struct SidebarView: View {
                     .help("Settings")
                     .disabled(suppressButtonInteractions)
                 }
+
+                ToolbarItem(placement: .primaryAction) {
+                    Button {
+                        store.startNewConversation()
+                    } label: {
+                        Image(systemName: "square.and.pencil")
+                    }
+                    .help("New Chat")
+                    .disabled(suppressButtonInteractions)
+                }
             }
         }
         .frame(minWidth: 230)
         .background(Color(nsColor: .windowBackgroundColor))
+        .background {
+            GeometryReader { geometry in
+                Color.clear
+                    .preference(key: SidebarWidthPreferenceKey.self, value: geometry.size.width)
+            }
+        }
         .background(
             PointerActivityMonitor {
                 suppressButtonInteractions = false
@@ -124,6 +140,14 @@ private struct SidebarRow: View {
                 isHoveringDeleteButton = false
             }
         }
+    }
+}
+
+struct SidebarWidthPreferenceKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = nextValue()
     }
 }
 

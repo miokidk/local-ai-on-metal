@@ -4,6 +4,7 @@ import SwiftUI
 struct ChatRootView: View {
     @ObservedObject var store: ChatStore
     @State private var columnVisibility: NavigationSplitViewVisibility = .all
+    @State private var sidebarWidth: CGFloat = 280
 
     var body: some View {
         Group {
@@ -20,21 +21,33 @@ struct ChatRootView: View {
                     )
                 }
                 .navigationSplitViewStyle(.balanced)
-                .background(TitlebarLocustAccessoryInstaller())
+                .onPreferenceChange(SidebarWidthPreferenceKey.self) { width in
+                    guard width > 0 else { return }
+                    sidebarWidth = width
+                }
                 .toolbar {
-                    ToolbarItem(placement: .primaryAction) {
-                        Button {
-                            store.startNewConversation()
-                        } label: {
-                            Image(systemName: "square.and.pencil")
+                    if !isSidebarVisible {
+                        ToolbarItem(placement: .primaryAction) {
+                            Button {
+                                store.startNewConversation()
+                            } label: {
+                                Image(systemName: "square.and.pencil")
+                            }
+                            .help("New Chat")
                         }
-                        .help("New Chat")
                     }
                 }
             } else {
                 LaunchScreenView(
                     errorMessage: store.launchErrorMessage,
                     onRetry: store.retryLaunchPreparation
+                )
+            }
+        }
+        .overlay(alignment: .top) {
+            if store.isLaunchReady {
+                UnifiedTitlebarOverlay(
+                    sidebarWidth: isSidebarVisible ? sidebarWidth : 0
                 )
             }
         }
@@ -45,6 +58,126 @@ struct ChatRootView: View {
 
     private var isSidebarVisible: Bool {
         columnVisibility != .detailOnly
+    }
+}
+
+private struct UnifiedTitlebarOverlay: View {
+    let sidebarWidth: CGFloat
+
+    private let overlayHeight: CGFloat = 92
+    private let shieldOverlap: CGFloat = 10
+
+    var body: some View {
+        GeometryReader { geometry in
+            let clampedSidebarWidth = min(max(sidebarWidth, 0), geometry.size.width)
+            let shieldWidth = min(clampedSidebarWidth + shieldOverlap, geometry.size.width)
+
+            ZStack(alignment: .topLeading) {
+                TitlebarBlurSection()
+                TitlebarTintOverlay()
+
+                if shieldWidth > 0 {
+                    SidebarShield(width: shieldWidth)
+                }
+
+                HStack {
+                    Spacer(minLength: 0)
+                    LocustTitlebarImage()
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+            }
+            .frame(width: geometry.size.width, height: overlayHeight, alignment: .topLeading)
+        }
+        .frame(height: overlayHeight)
+        .ignoresSafeArea(edges: .top)
+        .allowsHitTesting(false)
+    }
+}
+
+private struct TitlebarTintOverlay: View {
+    var body: some View {
+        LinearGradient(
+            stops: [
+                .init(color: Color(nsColor: .windowBackgroundColor).opacity(0.96), location: 0),
+                .init(color: Color(nsColor: .windowBackgroundColor).opacity(0.86), location: 0.42),
+                .init(color: Color(nsColor: .windowBackgroundColor).opacity(0.18), location: 0.82),
+                .init(color: .clear, location: 1)
+            ],
+            startPoint: .top,
+            endPoint: .bottom
+        )
+    }
+}
+
+private struct TitlebarBlurSection: View {
+    var body: some View {
+        WindowBlurView(material: .titlebar)
+            .mask {
+                LinearGradient(
+                    stops: [
+                        .init(color: .white, location: 0),
+                        .init(color: .white.opacity(0.9), location: 0.24),
+                        .init(color: .white.opacity(0.42), location: 0.62),
+                        .init(color: .clear, location: 1)
+                    ],
+                    startPoint: .top,
+                    endPoint: .bottom
+                )
+            }
+    }
+}
+
+private struct SidebarShield: View {
+    let width: CGFloat
+
+    var body: some View {
+        LinearGradient(
+            stops: [
+                .init(color: Color(nsColor: .windowBackgroundColor), location: 0),
+                .init(color: Color(nsColor: .windowBackgroundColor), location: 0.72),
+                .init(color: Color(nsColor: .windowBackgroundColor).opacity(0.92), location: 0.9),
+                .init(color: .clear, location: 1)
+            ],
+            startPoint: .leading,
+            endPoint: .trailing
+        )
+        .frame(width: width)
+        .frame(maxHeight: .infinity, alignment: .top)
+    }
+}
+
+private struct WindowBlurView: NSViewRepresentable {
+    let material: NSVisualEffectView.Material
+
+    func makeNSView(context: Context) -> NSVisualEffectView {
+        let view = NSVisualEffectView()
+        configure(view)
+        return view
+    }
+
+    func updateNSView(_ nsView: NSVisualEffectView, context: Context) {
+        configure(nsView)
+    }
+
+    private func configure(_ view: NSVisualEffectView) {
+        view.material = material
+        view.blendingMode = .withinWindow
+        view.state = .active
+    }
+}
+
+private struct LocustTitlebarImage: View {
+    var body: some View {
+        Image("LocustTitlebarMark")
+            .resizable()
+            .interpolation(.high)
+            .antialiased(true)
+            .aspectRatio(contentMode: .fit)
+            .frame(width: 40, height: 20)
+            .padding(.top, 15)
+            .padding(.trailing, 16)
+            .allowsHitTesting(false)
+            .accessibilityHidden(true)
     }
 }
 
@@ -69,7 +202,7 @@ private struct LaunchScreenView: View {
                     .resizable()
                     .interpolation(.high)
                     .aspectRatio(contentMode: .fit)
-                    .frame(width: 110, height: 52)
+                    .frame(width: 186, height: 186)
 
                 if let errorMessage {
                     VStack(spacing: 12) {
@@ -96,82 +229,5 @@ private struct LaunchScreenView: View {
             }
             .padding(40)
         }
-    }
-}
-
-private struct TitlebarLocustAccessoryInstaller: NSViewRepresentable {
-    func makeCoordinator() -> Coordinator {
-        Coordinator()
-    }
-
-    func makeNSView(context: Context) -> NSView {
-        let view = NSView(frame: .zero)
-        DispatchQueue.main.async {
-            context.coordinator.installIfNeeded(for: view.window)
-        }
-        return view
-    }
-
-    func updateNSView(_ nsView: NSView, context: Context) {
-        DispatchQueue.main.async {
-            context.coordinator.installIfNeeded(for: nsView.window)
-        }
-    }
-
-    static func dismantleNSView(_ nsView: NSView, coordinator: Coordinator) {
-        coordinator.removeAccessory()
-    }
-
-    final class Coordinator {
-        private weak var window: NSWindow?
-        private weak var accessory: NSTitlebarAccessoryViewController?
-
-        func installIfNeeded(for window: NSWindow?) {
-            guard let window else { return }
-            guard self.window !== window || accessory == nil else { return }
-
-            removeAccessory()
-
-            let accessory = NSTitlebarAccessoryViewController()
-            accessory.layoutAttribute = .right
-            accessory.fullScreenMinHeight = 32
-
-            let hostingView = NSHostingView(rootView: LocustTitlebarImage())
-            hostingView.frame = NSRect(x: 0, y: 0, width: 82, height: 36)
-            accessory.view = hostingView
-
-            window.addTitlebarAccessoryViewController(accessory)
-
-            self.window = window
-            self.accessory = accessory
-        }
-
-        func removeAccessory() {
-            guard let accessory, let window else { return }
-            if let index = window.titlebarAccessoryViewControllers.firstIndex(of: accessory) {
-                window.removeTitlebarAccessoryViewController(at: index)
-            }
-            self.accessory = nil
-            self.window = nil
-        }
-    }
-}
-
-private struct LocustTitlebarImage: View {
-    var body: some View {
-        HStack {
-            Spacer(minLength: 0)
-
-            Image("LocustMark")
-                .resizable()
-                .interpolation(.high)
-                .antialiased(true)
-                .aspectRatio(contentMode: .fit)
-                .frame(width: 62, height: 30)
-                .padding(.trailing, 8)
-                .allowsHitTesting(false)
-                .accessibilityHidden(true)
-        }
-        .frame(width: 82, height: 36, alignment: .trailing)
     }
 }
