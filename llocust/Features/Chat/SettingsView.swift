@@ -21,6 +21,28 @@ struct SettingsView: View {
             Divider()
 
             Form {
+                Section("Model") {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text("Base model: \(AppSettings.displayName(for: AppSettings.defaultModelIdentifier))")
+                            .font(.system(size: 13, weight: .medium))
+
+                        HStack {
+                            Text("Replies start on oss 20b. Smart and Smarter then revise that draft with qwen before the final answer reaches you.")
+                                .font(.system(size: 12))
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                            Button("Reload Models") {
+                                store.refreshServerMetadata()
+                            }
+                        }
+
+                        Text("llocust warms oss 20b during launch so the app opens sooner without swapping away from the main reply model before your first message.")
+                            .font(.system(size: 12))
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(.vertical, 4)
+                }
+
                 Section("Generation") {
                     VStack(alignment: .leading, spacing: 10) {
                         HStack(alignment: .firstTextBaseline) {

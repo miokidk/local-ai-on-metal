@@ -27,6 +27,7 @@ struct ChatRootView: View {
                 }
             } else {
                 LaunchScreenView(
+                    modelName: store.settings.modelDisplayName,
                     errorMessage: store.launchErrorMessage,
                     onRetry: store.retryLaunchPreparation
                 )
@@ -186,6 +187,7 @@ private struct LocustTitlebarImage: View {
 }
 
 private struct LaunchScreenView: View {
+    let modelName: String
     let errorMessage: String?
     let onRetry: () -> Void
 
@@ -224,9 +226,9 @@ private struct LaunchScreenView: View {
                 } else {
                     ProgressView()
                         .controlSize(.regular)
-                    Text("Starting oss 20b…")
+                    Text("Starting \(modelName)…")
                         .font(.system(size: 22, weight: .semibold))
-                    Text("The app will open as soon as the model is warm and ready.")
+                    Text("The app will open as soon as the reply model is warm and ready for your first message.")
                         .font(.system(size: 14, weight: .medium))
                         .foregroundStyle(.secondary)
                 }

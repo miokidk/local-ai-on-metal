@@ -5,6 +5,7 @@ struct MessageComposerView: View {
     @Binding var text: String
     @Binding var attachments: [ChatAttachment]
     @Binding var selectedReasoningEffort: ReasoningEffort
+    @Binding var selectedResponseMode: AssistantResponseMode
     let isStreaming: Bool
     let onAddAttachment: () -> Void
     let onRemoveAttachment: (UUID) -> Void
@@ -46,7 +47,8 @@ struct MessageComposerView: View {
 
             if text.isEmpty && attachments.isEmpty {
                 Text("Send a message")
-                    .font(.system(size: 18, weight: .medium))
+                    .font(AppTypography.readingFont(size: 19, weight: .light))
+                    .tracking(AppTypography.bodyTracking)
                     .foregroundStyle(Color.secondary.opacity(0.9))
                     .padding(.horizontal, 22)
                     .padding(.top, 18)
@@ -100,6 +102,26 @@ struct MessageComposerView: View {
                     } label: {
                         HStack(spacing: 6) {
                             Text(selectedReasoningEffort.title)
+                                .font(.system(size: 15, weight: .regular))
+                            Image(systemName: "chevron.down")
+                                .font(.system(size: 10, weight: .medium))
+                        }
+                        .foregroundStyle(Color.secondary.opacity(0.72))
+                        .contentShape(Rectangle())
+                    }
+                    .menuIndicator(.hidden)
+                    .buttonStyle(.plain)
+                    .fixedSize()
+
+                    Menu {
+                        ForEach(AssistantResponseMode.allCases) { mode in
+                            Button(mode.title) {
+                                selectedResponseMode = mode
+                            }
+                        }
+                    } label: {
+                        HStack(spacing: 6) {
+                            Text(selectedResponseMode.title)
                                 .font(.system(size: 15, weight: .regular))
                             Image(systemName: "chevron.down")
                                 .font(.system(size: 10, weight: .medium))

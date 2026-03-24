@@ -3,12 +3,14 @@ import Foundation
 struct ParsedResponsePayload {
     var outputText: String
     var thoughts: String?
+    var outputItems: [[String: Any]] = []
+    var toolCalls: [ParsedResponseToolCall] = []
 }
 
 enum ParsedStreamingPayload {
     case thoughtsDelta(String)
     case outputDelta(String)
-    case completed(finalText: String?, thoughts: String?)
+    case completed(ParsedResponsePayload)
 }
 
 enum ResponsesPayloadParser {
@@ -21,7 +23,12 @@ enum ResponsesPayloadParser {
         let responseObject = rootResponseObject(from: jsonObject)
         let outputText = ModelOutputSanitizer.sanitize(assistantOutputText(in: responseObject))
         let thoughts = normalize(ModelOutputSanitizer.sanitize(reasoningText(in: responseObject)))
-        return ParsedResponsePayload(outputText: outputText, thoughts: thoughts)
+        return ParsedResponsePayload(
+            outputText: outputText,
+            thoughts: thoughts,
+            outputItems: outputItems(in: responseObject),
+            toolCalls: toolCalls(in: responseObject)
+        )
     }
 
     static func parseStreamingEvent(data: Data, eventName: String?) -> [ParsedStreamingPayload] {
@@ -39,15 +46,15 @@ enum ResponsesPayloadParser {
             return stringValue(forKey: "delta", in: dictionary).nonEmpty.map { [.outputDelta($0)] } ?? []
         case "response.reasoning_text.done":
             return stringValue(forKey: "text", in: dictionary).nonEmpty.map {
-                [.completed(finalText: nil, thoughts: ModelOutputSanitizer.sanitize($0))]
+                [.completed(ParsedResponsePayload(outputText: "", thoughts: ModelOutputSanitizer.sanitize($0)))]
             } ?? []
         case "response.output_text.done":
             return stringValue(forKey: "text", in: dictionary).nonEmpty.map {
-                [.completed(finalText: ModelOutputSanitizer.sanitize($0), thoughts: nil)]
+                [.completed(ParsedResponsePayload(outputText: ModelOutputSanitizer.sanitize($0), thoughts: nil))]
             } ?? []
         case "response.completed":
             let parsed = parseResponse(jsonObject: dictionary["response"] ?? dictionary)
-            return [.completed(finalText: normalize(parsed.outputText), thoughts: parsed.thoughts)]
+            return [.completed(parsed)]
         default:
             return []
         }
@@ -108,6 +115,43 @@ enum ResponsesPayloadParser {
         }
 
         return text
+    }
+
+    private static func outputItems(in jsonObject: Any) -> [[String: Any]] {
+        guard let dictionary = jsonObject as? [String: Any],
+              let output = dictionary["output"] as? [[String: Any]] else {
+            return []
+        }
+
+        return output
+    }
+
+    private static func toolCalls(in jsonObject: Any) -> [ParsedResponseToolCall] {
+        outputItems(in: jsonObject).compactMap { item in
+            guard (item["type"] as? String)?.lowercased() == "function_call",
+                  let name = item["name"] as? String,
+                  let callID = item["call_id"] as? String else {
+                return nil
+            }
+
+            let argumentsJSON: String
+            if let arguments = item["arguments"] as? String {
+                argumentsJSON = arguments
+            } else if let arguments = item["arguments"],
+                      JSONSerialization.isValidJSONObject(arguments),
+                      let data = try? JSONSerialization.data(withJSONObject: arguments, options: []),
+                      let string = String(data: data, encoding: .utf8) {
+                argumentsJSON = string
+            } else {
+                argumentsJSON = "{}"
+            }
+
+            return ParsedResponseToolCall(
+                name: name,
+                callID: callID,
+                argumentsJSON: argumentsJSON
+            )
+        }
     }
 
     private static func eventType(in dictionary: [String: Any]) -> String? {

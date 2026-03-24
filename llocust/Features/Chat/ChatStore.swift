@@ -41,6 +41,7 @@ final class ChatStore: ObservableObject {
     private let persistence = ChatPersistence()
     private let client = ResponsesAPIClient()
     private let localServer = LocalModelServer()
+    private let weatherService = WeatherService()
     private let userDefaults = UserDefaults.standard
     private let settingsKey = "llocust.Settings"
 
@@ -50,7 +51,9 @@ final class ChatStore: ObservableObject {
     private var rawOutputBuffers: [UUID: String] = [:]
     private var rawThoughtBuffers: [UUID: String] = [:]
     private var launchPreparationTask: Task<Void, Never>?
-    private var didCompletePrewarm = false
+    private var postLaunchWarmupTask: Task<Void, Never>?
+    private var launchPreparationGeneration: Int = 0
+    private var warmedLaunchModels: Set<String> = []
     private var didLoadPersistedState = false
     private var didPrepareLaunchModel = false
     private let pinnedBaseURL = URL(string: AppSettings.defaultBaseURL)!
@@ -65,9 +68,10 @@ final class ChatStore: ObservableObject {
             settings = AppSettings()
         }
 
-        settings.normalizeForSingleModel()
+        settings.normalize()
         persistSettings()
-        startLaunchPreparationIfNeeded()
+        startLaunchPreparationIfNeeded(forceRestart: true)
+        weatherService.start()
 
         Task {
             await loadPersistedState()
@@ -94,6 +98,10 @@ final class ChatStore: ObservableObject {
     var canRegenerateSelectedConversation: Bool {
         guard let conversation = selectedConversation else { return false }
         return canRegenerate(conversationID: conversation.id)
+    }
+
+    var modelPickerOptions: [String] {
+        AppSettings.modelPickerOptions()
     }
 
     func contextCompactionMessage(for conversationID: UUID?) -> String? {
@@ -275,7 +283,13 @@ final class ChatStore: ObservableObject {
     }
 
     func selectModel(_ model: String) {
-        settings.registerModel(model)
+        _ = model
+        settings.normalize(availableModels: modelPickerOptions)
+    }
+
+    func applyDefaultModel(_ model: String) {
+        _ = model
+        settings.normalize(availableModels: modelPickerOptions)
     }
 
     func selectReasoningEffort(_ effort: ReasoningEffort) {
@@ -293,12 +307,10 @@ final class ChatStore: ObservableObject {
     }
 
     func refreshServerMetadata() {
-        settings.normalizeForSingleModel()
+        settings.normalize(availableModels: modelPickerOptions)
         connectionState = .checking
 
-        Task { [weak self] in
-            await self?.refreshServerMetadataNow()
-        }
+        startLaunchPreparationIfNeeded(forceRestart: true)
     }
 
     func retryLaunchPreparation() {
@@ -314,7 +326,8 @@ final class ChatStore: ObservableObject {
         guard streamTasks[conversationID] == nil,
               let conversationIndex = indexForConversation(conversationID) else { return }
 
-        settings.normalizeForSingleModel()
+        settings.normalize(availableModels: modelPickerOptions)
+        let responseMode = settings.selectedResponseMode
 
         let assistantMessage = ChatMessage(
             role: .assistant,
@@ -333,26 +346,61 @@ final class ChatStore: ObservableObject {
             let requestedBaseURL = AppSettings.defaultBaseURL
 
             do {
+                self.postLaunchWarmupTask?.cancel()
+                self.postLaunchWarmupTask = nil
+
                 if let launchPreparationTask = self.launchPreparationTask {
                     await launchPreparationTask.value
                 }
 
                 var didAttemptEnsureRunning = false
                 var didAttemptRecovery = false
+                var didAttemptFalseRefusalRecovery = false
 
                 while true {
                     try Task.checkCancellation()
-                    let request = try self.makeAssistantRequest(for: conversationID)
-                    self.streamRequestIDs[conversationID] = request.requestID
+                    let plan = try self.makeAssistantReplyPlan(for: conversationID)
 
                     do {
                         self.clearContextCompactionStatus(for: conversationID)
-                        self.applyResolvedServerMetadata(self.fixedServerMetadata())
-                        let stream = self.client.streamResponse(for: request)
-                        for try await event in stream {
-                            try Task.checkCancellation()
-                            self.consume(event, conversationID: conversationID)
+                        if responseMode == .chat {
+                            try await self.streamPrimaryResponse(
+                                for: conversationID,
+                                request: plan.request
+                            )
+                        } else {
+                            try await self.completeReviewedResponse(
+                                for: conversationID,
+                                plan: plan,
+                                responseMode: responseMode
+                            )
                         }
+
+                        if !didAttemptFalseRefusalRecovery,
+                           let retryRequest = self.makeFalseRefusalRecoveryRequestIfNeeded(
+                            for: conversationID,
+                            baseRequest: plan.request
+                           ) {
+                            didAttemptFalseRefusalRecovery = true
+                            self.resetAssistantStreamingMessage(in: conversationID)
+
+                            if responseMode == .chat {
+                                try await self.streamPrimaryResponse(
+                                    for: conversationID,
+                                    request: retryRequest
+                                )
+                            } else {
+                                try await self.completeReviewedResponse(
+                                    for: conversationID,
+                                    plan: AssistantReplyPlan(
+                                        preparedContext: plan.preparedContext,
+                                        request: retryRequest
+                                    ),
+                                    responseMode: responseMode
+                                )
+                            }
+                        }
+
                         break
                     } catch is CancellationError {
                         throw CancellationError()
@@ -368,22 +416,26 @@ final class ChatStore: ObservableObject {
                             continue
                         }
 
-                        if !didAttemptEnsureRunning, self.shouldRetryAfterEnsuringServer(error) {
+                        if !didAttemptEnsureRunning,
+                           self.usesResponsesServerForDefaultModel,
+                           self.shouldRetryAfterEnsuringServer(error) {
                             didAttemptEnsureRunning = true
                             self.connectionState = .checking
-                            try await self.localServer.ensureRunning()
-                            self.applyResolvedServerMetadata(self.fixedServerMetadata())
+                            try await self.localServer.ensureRunning(modelReference: self.resolvedDefaultModel)
+                            await self.reloadAvailableModels()
                             continue
                         }
 
-                        guard !didAttemptRecovery, self.shouldRecoverFromServerError(error) else {
+                        guard !didAttemptRecovery,
+                              self.usesResponsesServerForDefaultModel,
+                              self.shouldRecoverFromServerError(error) else {
                             throw error
                         }
 
                         didAttemptRecovery = true
                         self.connectionState = .checking
-                        try await self.localServer.forceRestart()
-                        self.applyResolvedServerMetadata(self.fixedServerMetadata())
+                        try await self.localServer.forceRestart(modelReference: self.resolvedDefaultModel)
+                        await self.reloadAvailableModels()
                     }
                 }
 
@@ -403,7 +455,7 @@ final class ChatStore: ObservableObject {
         streamTasks[conversationID] = task
     }
 
-    private func makeAssistantRequest(for conversationID: UUID) throws -> ResponsesAPIRequest {
+    private func makeAssistantReplyPlan(for conversationID: UUID) throws -> AssistantReplyPlan {
         guard let conversationIndex = indexForConversation(conversationID) else {
             throw ResponsesAPIError.serverUnavailable("This conversation is no longer available.")
         }
@@ -416,19 +468,291 @@ final class ChatStore: ObservableObject {
         )
         let samplingProfile = samplingProfile(for: preparedContext.messages)
 
+        return AssistantReplyPlan(
+            preparedContext: preparedContext,
+            request: ResponsesAPIRequest(
+                requestID: UUID().uuidString,
+                baseURL: pinnedBaseURL,
+                apiKey: settings.apiKey.nonEmpty,
+                model: resolvedDefaultModel,
+                reasoningEffort: settings.selectedReasoningEffort,
+                temperature: samplingProfile.temperature,
+                repeatPenalty: settings.repeatPenalty,
+                topP: samplingProfile.topP,
+                maxOutputTokens: nil,
+                instructions: assistantInstructions(
+                    baseInstructions: preparedContext.instructions,
+                    model: resolvedDefaultModel
+                ),
+                messages: preparedContext.messages,
+                tools: availableTools(for: resolvedDefaultModel)
+            )
+        )
+    }
+
+    private func streamPrimaryResponse(
+        for conversationID: UUID,
+        request: ResponsesAPIRequest
+    ) async throws {
+        if request.tools.isEmpty {
+            streamRequestIDs[conversationID] = AppSettings.usesResponsesServer(request.model) ? request.requestID : nil
+            let stream = client.streamResponse(for: request)
+            for try await event in stream {
+                try Task.checkCancellation()
+                consume(event, conversationID: conversationID)
+            }
+            return
+        }
+
+        var toolInputItems = request.inputItems
+        var activeRequest = request
+        let maxToolRounds = 4
+
+        for round in 0..<maxToolRounds {
+            streamRequestIDs[conversationID] = AppSettings.usesResponsesServer(activeRequest.model) ? activeRequest.requestID : nil
+            let stream = client.streamResponse(for: activeRequest)
+            var finalPayload: ParsedResponsePayload?
+
+            for try await event in stream {
+                try Task.checkCancellation()
+                consume(event, conversationID: conversationID)
+
+                if case .completed(let payload) = event {
+                    finalPayload = payload
+                }
+            }
+
+            guard let payload = finalPayload else {
+                return
+            }
+
+            guard !payload.toolCalls.isEmpty else {
+                return
+            }
+
+            toolInputItems.append(contentsOf: payload.outputItems)
+            toolInputItems.append(contentsOf: await toolOutputItems(for: payload.toolCalls))
+
+            if round < maxToolRounds - 1 {
+                resetAssistantStreamingMessage(in: conversationID)
+            }
+
+            activeRequest = request.replacing(
+                requestID: UUID().uuidString,
+                inputItems: toolInputItems
+            )
+        }
+
+        throw ResponsesAPIError.serverUnavailable("The model kept requesting tools without returning a final answer.")
+    }
+
+    private func completeReviewedResponse(
+        for conversationID: UUID,
+        plan: AssistantReplyPlan,
+        responseMode: AssistantResponseMode
+    ) async throws {
+        guard let reviewerModel = responseMode.reviewerModelIdentifier else {
+            throw ResponsesAPIError.serverUnavailable("No reviewer model was configured for this mode.")
+        }
+
+        var transcript = ReviewedThoughtTranscript(
+            primaryModelDisplayName: AppSettings.displayName(for: plan.request.model),
+            reviewerModelDisplayName: AppSettings.displayName(for: reviewerModel)
+        )
+
+        let primaryStage = try await streamReviewedStage(
+            for: conversationID,
+            request: plan.request,
+            stage: .primary,
+            transcript: transcript
+        )
+        transcript = primaryStage.transcript
+        let primaryResponse = primaryStage.payload
+        try Task.checkCancellation()
+
+        let reviewerRequest = makeReviewerRequest(
+            preparedContext: plan.preparedContext,
+            primaryResponse: primaryResponse,
+            reviewerModel: reviewerModel
+        )
+        let reviewerStage = try await streamReviewedStage(
+            for: conversationID,
+            request: reviewerRequest,
+            stage: .reviewer,
+            transcript: transcript
+        )
+        transcript = reviewerStage.transcript
+        try Task.checkCancellation()
+
+        applyReviewedTranscript(
+            transcript,
+            visibleContent: reviewerStage.payload.outputText,
+            isStreaming: true,
+            in: conversationID
+        )
+    }
+
+    private func streamReviewedStage(
+        for conversationID: UUID,
+        request: ResponsesAPIRequest,
+        stage: ReviewedStreamStage,
+        transcript initialTranscript: ReviewedThoughtTranscript
+    ) async throws -> ReviewedStageResult {
+        var transcript = initialTranscript
+
+        if !request.tools.isEmpty {
+            var toolInputItems = request.inputItems
+            var activeRequest = request
+            let maxToolRounds = 4
+
+            for round in 0..<maxToolRounds {
+                streamRequestIDs[conversationID] = AppSettings.usesResponsesServer(activeRequest.model) ? activeRequest.requestID : nil
+
+                let stream = client.streamResponse(for: activeRequest)
+                var finalPayload: ParsedResponsePayload?
+                for try await event in stream {
+                    try Task.checkCancellation()
+                    transcript.apply(event, to: stage)
+
+                    let visibleContent: String?
+                    switch stage {
+                    case .primary:
+                        visibleContent = nil
+                    case .reviewer:
+                        visibleContent = transcript.payload(for: .reviewer).outputText
+                    }
+
+                    applyReviewedTranscript(
+                        transcript,
+                        visibleContent: visibleContent,
+                        isStreaming: true,
+                        in: conversationID
+                    )
+
+                    if case .completed(let payload) = event {
+                        finalPayload = payload
+                    }
+                }
+
+                guard let payload = finalPayload else {
+                    return ReviewedStageResult(
+                        transcript: transcript,
+                        payload: transcript.payload(for: stage)
+                    )
+                }
+
+                guard !payload.toolCalls.isEmpty else {
+                    return ReviewedStageResult(
+                        transcript: transcript,
+                        payload: payload
+                    )
+                }
+
+                toolInputItems.append(contentsOf: payload.outputItems)
+                toolInputItems.append(contentsOf: await toolOutputItems(for: payload.toolCalls))
+
+                if round < maxToolRounds - 1 {
+                    transcript.reset(stage: stage)
+                }
+
+                activeRequest = request.replacing(
+                    requestID: UUID().uuidString,
+                    inputItems: toolInputItems
+                )
+            }
+
+            throw ResponsesAPIError.serverUnavailable("The model kept requesting tools without returning a final answer.")
+        }
+
+        streamRequestIDs[conversationID] = AppSettings.usesResponsesServer(request.model) ? request.requestID : nil
+
+        let stream = client.streamResponse(for: request)
+        for try await event in stream {
+            try Task.checkCancellation()
+            transcript.apply(event, to: stage)
+
+            let visibleContent: String?
+            switch stage {
+            case .primary:
+                visibleContent = nil
+            case .reviewer:
+                visibleContent = transcript.payload(for: .reviewer).outputText
+            }
+
+            applyReviewedTranscript(
+                transcript,
+                visibleContent: visibleContent,
+                isStreaming: true,
+                in: conversationID
+            )
+        }
+
+        return ReviewedStageResult(
+            transcript: transcript,
+            payload: transcript.payload(for: stage)
+        )
+    }
+
+    private func makeReviewerRequest(
+        preparedContext: PreparedConversationContext,
+        primaryResponse: ParsedResponsePayload,
+        reviewerModel: String
+    ) -> ResponsesAPIRequest {
+        let reviewPrompt = """
+Review the assistant draft above before it goes to the user.
+
+First decide whether the draft needs any factual or operational improvement at all.
+If it is already correct, workable, and helpful enough, return it unchanged immediately.
+
+If changes are needed, make the smallest possible edits needed to fix:
+- factual mistakes
+- code, commands, or steps that would not work
+- unsupported claims
+- missing details that would otherwise make the answer fail
+
+Keep the wording, tone, structure, and personality as close to the draft as possible.
+Do not rewrite just to improve style or to sound more like you.
+Return only the final answer for the user.
+"""
+
         return ResponsesAPIRequest(
             requestID: UUID().uuidString,
             baseURL: pinnedBaseURL,
             apiKey: settings.apiKey.nonEmpty,
-            model: AppSettings.fixedModelIdentifier,
-            reasoningEffort: settings.selectedReasoningEffort,
-            temperature: samplingProfile.temperature,
-            repeatPenalty: settings.repeatPenalty,
-            topP: samplingProfile.topP,
+            model: reviewerModel,
+            reasoningEffort: .medium,
+            temperature: 0.12,
+            repeatPenalty: 0.25,
+            topP: 0.8,
             maxOutputTokens: nil,
-            instructions: preparedContext.instructions,
-            messages: preparedContext.messages
+            instructions: reviewerInstructions(
+                baseInstructions: preparedContext.instructions
+            ),
+            messages: preparedContext.messages + [
+                ChatMessage(role: .assistant, content: primaryResponse.outputText),
+                ChatMessage(role: .user, content: reviewPrompt)
+            ]
         )
+    }
+
+    private func reviewerInstructions(baseInstructions: String) -> String {
+        [
+            baseInstructions,
+            """
+You are checking and minimally revising a draft reply from another model before it reaches the user.
+Your job is verification, not restyling.
+Preserve the draft whenever possible.
+If the draft is already factually sound, operationally correct, and helpful enough, return it unchanged.
+When a correction is necessary, keep the edit as small as possible and preserve the original wording, tone, structure, and personality.
+Focus on factual accuracy, whether code or steps would actually work, unsupported claims, and missing details that would otherwise cause failure.
+Think in a short, disciplined way: check the draft once, decide quickly whether any fix is actually needed, then either keep it or make the smallest necessary correction.
+Do not repeatedly restate the task, re-read the prompt, compare multiple rewrites, or narrate uncertainty after you already have a sufficient answer.
+If there is no concrete factual or operational problem to fix, stop and return the draft as-is.
+Do not add your own personality, do not make the response chattier or sharper, and do not mention the review process.
+"""
+        ]
+        .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        .joined(separator: "\n\n")
     }
 
     private func compactConversationContextIfNeeded(
@@ -558,7 +882,7 @@ final class ChatStore: ObservableObject {
             requestID: UUID().uuidString,
             baseURL: pinnedBaseURL,
             apiKey: settings.apiKey.nonEmpty,
-            model: AppSettings.fixedModelIdentifier,
+            model: resolvedDefaultModel,
             reasoningEffort: .low,
             temperature: 0.35,
             repeatPenalty: 0.1,
@@ -656,12 +980,12 @@ final class ChatStore: ObservableObject {
             rawOutputBuffers[conversationID] = combined
             conversations[conversationIndex].messages[messageIndex].content = ModelOutputSanitizer.sanitize(combined)
             conversations[conversationIndex].messages[messageIndex].isThoughtsStreaming = false
-        case .completed(let finalText, let thoughts):
-            if let finalText {
+        case .completed(let payload):
+            if let finalText = payload.outputText.nonEmpty {
                 rawOutputBuffers[conversationID] = finalText
                 conversations[conversationIndex].messages[messageIndex].content = ModelOutputSanitizer.sanitize(finalText)
             }
-            if let thoughts {
+            if let thoughts = payload.thoughts {
                 rawThoughtBuffers[conversationID] = thoughts
                 let normalizedThoughts = normalizedThoughts(ModelOutputSanitizer.sanitize(thoughts))
                 let currentThoughtCount = (conversations[conversationIndex].messages[messageIndex].thoughts ?? "").count
@@ -672,7 +996,7 @@ final class ChatStore: ObservableObject {
                 }
 
                 conversations[conversationIndex].messages[messageIndex].isThoughtsStreaming = false
-            } else if finalText != nil {
+            } else if payload.outputText.nonEmpty != nil {
                 conversations[conversationIndex].messages[messageIndex].isThoughtsStreaming = false
             }
         }
@@ -686,7 +1010,7 @@ final class ChatStore: ObservableObject {
         clearRawStreamingBuffers(for: conversationID)
 
         guard let conversationIndex = indexForConversation(conversationID),
-              let messageIndex = conversations[conversationIndex].messages.lastIndex(where: { $0.role == .assistant }) else {
+              let messageIndex = conversations[conversationIndex].messages.lastIndex(where: { $0.role == .assistant && $0.state == .streaming }) else {
             scheduleSave()
             return
         }
@@ -712,7 +1036,7 @@ final class ChatStore: ObservableObject {
         clearRawStreamingBuffers(for: conversationID)
 
         guard let conversationIndex = indexForConversation(conversationID),
-              let assistantIndex = conversations[conversationIndex].messages.lastIndex(where: { $0.role == .assistant }) else {
+              let assistantIndex = conversations[conversationIndex].messages.lastIndex(where: { $0.role == .assistant && $0.state == .streaming }) else {
             presentErrorMessage(message)
             return
         }
@@ -956,28 +1280,13 @@ final class ChatStore: ObservableObject {
         return "Couldn’t attach that file."
     }
 
-    private func fixedServerMetadata() -> ResponsesServerMetadata {
-        ResponsesServerMetadata(
-            baseURL: pinnedBaseURL,
-            models: [AppSettings.fixedModelIdentifier]
-        )
-    }
-
     private func applyResolvedServerMetadata(_ metadata: ResponsesServerMetadata) {
-        let models = metadata.models.isEmpty ? [AppSettings.fixedModelIdentifier] : metadata.models
-        availableModels = models
-        connectionState = .connected(models)
-        settings.normalizeForSingleModel()
+        let models = AppSettings.normalizedModelList(metadata.models)
+        let fallbackModels = models.isEmpty ? AppSettings.supportedModelIdentifiers : AppSettings.normalizedModelList(models + AppSettings.supportedModelIdentifiers)
 
-        let resolvedModel = resolvePreferredModel(from: models)
-        if resolvedModel != settings.selectedModel {
-            settings.registerModel(resolvedModel)
-        }
-    }
-
-    private func resolvePreferredModel(from models: [String]) -> String {
-        _ = models
-        return AppSettings.fixedModelIdentifier
+        settings.normalize(availableModels: fallbackModels)
+        availableModels = fallbackModels
+        connectionState = .connected(fallbackModels)
     }
 
     private func friendlyMessage(for error: Error, requestedBaseURL: String? = nil) -> String {
@@ -995,14 +1304,162 @@ final class ChatStore: ObservableObject {
     }
 
     private func refreshServerMetadataNow() async {
-        startLaunchPreparationIfNeeded()
+        startLaunchPreparationIfNeeded(forceRestart: true)
         await launchPreparationTask?.value
     }
 
+    private var resolvedDefaultModel: String {
+        AppSettings.canonicalModelIdentifier(settings.defaultModel)
+    }
+
+    private var usesDirectOllamaForDefaultModel: Bool {
+        AppSettings.usesDirectOllamaAPI(resolvedDefaultModel)
+    }
+
+    private var usesResponsesServerForDefaultModel: Bool {
+        AppSettings.usesResponsesServer(resolvedDefaultModel)
+    }
+
+    private func reloadAvailableModels() async {
+        do {
+            let metadata = try await client.resolveServerMetadata(
+                preferredBaseURL: pinnedBaseURL,
+                apiKey: settings.apiKey.nonEmpty
+            )
+            applyResolvedServerMetadata(metadata)
+        } catch {
+            applyResolvedServerMetadata(
+                ResponsesServerMetadata(baseURL: pinnedBaseURL, models: [resolvedDefaultModel])
+            )
+        }
+    }
+
+    private func applyReviewedTranscript(
+        _ transcript: ReviewedThoughtTranscript,
+        visibleContent: String?,
+        isStreaming: Bool,
+        in conversationID: UUID
+    ) {
+        guard let conversationIndex = indexForConversation(conversationID),
+              let messageIndex = conversations[conversationIndex].messages.lastIndex(where: { $0.role == .assistant && $0.state == .streaming }) else {
+            return
+        }
+
+        let normalizedVisibleContent = visibleContent.map(ModelOutputSanitizer.sanitize) ?? ""
+        let normalizedThoughts = transcript.markdown.flatMap(normalizedThoughts)
+
+        conversations[conversationIndex].messages[messageIndex].content = normalizedVisibleContent
+        conversations[conversationIndex].messages[messageIndex].thoughts = normalizedThoughts
+        conversations[conversationIndex].messages[messageIndex].isThoughtsStreaming = isStreaming
+        rawOutputBuffers[conversationID] = normalizedVisibleContent.isEmpty ? nil : normalizedVisibleContent
+        rawThoughtBuffers[conversationID] = normalizedThoughts
+        touchConversation(at: conversationIndex)
+    }
+
     private func normalizedThoughts(_ text: String) -> String? {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmed = ModelOutputSanitizer.sanitizeThoughts(text)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
         return trimmed
+    }
+
+    private func makeFalseRefusalRecoveryRequestIfNeeded(
+        for conversationID: UUID,
+        baseRequest: ResponsesAPIRequest
+    ) -> ResponsesAPIRequest? {
+        guard let conversationIndex = indexForConversation(conversationID) else {
+            return nil
+        }
+
+        guard let lastUserPrompt = conversations[conversationIndex].messages.last(where: { $0.role == .user })?.trimmedContent,
+              isLikelyBenignWellnessRequest(lastUserPrompt),
+              let assistantText = conversations[conversationIndex].messages.last(where: { $0.role == .assistant })?.trimmedContent,
+              isLikelyGenericRefusal(assistantText) else {
+            return nil
+        }
+
+        let instructions = [
+            baseRequest.instructions?.trimmingCharacters(in: .whitespacesAndNewlines),
+            """
+The previous draft appears to have incorrectly refused a benign wellness request.
+If the user is asking for practical help with quitting smoking or vaping, answer directly with a useful plan instead of refusing.
+Do not mention policy, moderation, or whether the request is allowed.
+"""
+        ]
+        .compactMap { $0 }
+        .filter { !$0.isEmpty }
+        .joined(separator: "\n\n")
+
+        return ResponsesAPIRequest(
+            requestID: UUID().uuidString,
+            baseURL: baseRequest.baseURL,
+            apiKey: baseRequest.apiKey,
+            model: baseRequest.model,
+            reasoningEffort: .medium,
+            temperature: min(baseRequest.temperature, 0.78),
+            repeatPenalty: baseRequest.repeatPenalty,
+            topP: min(baseRequest.topP, 0.92),
+            maxOutputTokens: baseRequest.maxOutputTokens,
+            instructions: instructions,
+            messages: baseRequest.messages,
+            inputItems: baseRequest.inputItems,
+            tools: baseRequest.tools
+        )
+    }
+
+    private func isLikelyGenericRefusal(_ text: String) -> Bool {
+        let normalized = text
+            .lowercased()
+            .replacingOccurrences(of: "’", with: "'")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard normalized.count <= 220 else {
+            return false
+        }
+
+        let refusalPhrases = [
+            "i'm sorry, but i can't help with that",
+            "i can't help with that",
+            "i cant help with that",
+            "i can't assist with that",
+            "i cant assist with that",
+            "i can't provide that",
+            "i cant provide that"
+        ]
+
+        return refusalPhrases.contains(where: normalized.contains)
+    }
+
+    private func isLikelyBenignWellnessRequest(_ text: String) -> Bool {
+        let normalized = text
+            .lowercased()
+            .replacingOccurrences(of: "’", with: "'")
+
+        let benignSignals = [
+            "stop smoking",
+            "quit smoking",
+            "smoking cessation",
+            "stop vaping",
+            "quit vaping",
+            "quit nicotine",
+            "nicotine plan",
+            "how to stop smoking",
+            "how do i stop smoking"
+        ]
+
+        let dangerousSignals = [
+            "kill",
+            "suicide",
+            "self-harm",
+            "hurt myself",
+            "weapon",
+            "bomb",
+            "hack",
+            "poison"
+        ]
+
+        return benignSignals.contains(where: normalized.contains)
+            && !dangerousSignals.contains(where: normalized.contains)
     }
 
     private func shouldRecoverFromServerError(_ error: Error) -> Bool {
@@ -1035,17 +1492,31 @@ final class ChatStore: ObservableObject {
         return false
     }
 
-    private func startLaunchPreparationIfNeeded() {
+    private func startLaunchPreparationIfNeeded(forceRestart: Bool = false) {
+        if forceRestart {
+            launchPreparationTask?.cancel()
+            launchPreparationTask = nil
+            postLaunchWarmupTask?.cancel()
+            postLaunchWarmupTask = nil
+            warmedLaunchModels.removeAll()
+            didPrepareLaunchModel = false
+        }
+
         guard launchPreparationTask == nil else { return }
         connectionState = .checking
         launchErrorMessage = nil
 
-        let request = modelWarmupRequest()
+        let modelReference = resolvedDefaultModel
+        let criticalLaunchModels = launchPreparationModels
+        launchPreparationGeneration += 1
+        let generation = launchPreparationGeneration
         launchPreparationTask = Task { [weak self] in
             guard let self else { return }
 
             defer {
-                self.launchPreparationTask = nil
+                if self.launchPreparationGeneration == generation {
+                    self.launchPreparationTask = nil
+                }
             }
 
             do {
@@ -1053,30 +1524,31 @@ final class ChatStore: ObservableObject {
 
                 while true {
                     do {
-                        try await self.localServer.ensureRunning()
-
-                        if !self.didCompletePrewarm {
-                            let stream = self.client.streamResponse(for: request)
-                            for try await _ in stream {
-                                try Task.checkCancellation()
+                        if self.usesResponsesServerForDefaultModel {
+                            if forceRestart {
+                                try await self.localServer.forceRestart(modelReference: modelReference)
+                            } else {
+                                try await self.localServer.ensureRunning(modelReference: modelReference)
                             }
-                            self.didCompletePrewarm = true
+                        } else if self.usesDirectOllamaForDefaultModel {
+                            await self.localServer.stopIfNeeded()
                         }
 
-                        self.applyResolvedServerMetadata(self.fixedServerMetadata())
-                        self.didPrepareLaunchModel = true
-                        self.updateLaunchReadiness()
+                        try await self.prewarmLaunchModels(criticalLaunchModels)
+                        self.markLaunchPreparationReady()
+                        self.startPostLaunchMetadataRefresh(generation: generation)
                         break
                     } catch is CancellationError {
                         throw CancellationError()
                     } catch {
-                        guard !didAttemptRecovery,
+                        guard self.usesResponsesServerForDefaultModel,
+                              !didAttemptRecovery,
                               self.shouldRecoverFromServerError(error) || self.shouldRetryAfterEnsuringServer(error) else {
                             throw error
                         }
 
                         didAttemptRecovery = true
-                        try await self.localServer.forceRestart()
+                        try await self.localServer.forceRestart(modelReference: modelReference)
                     }
                 }
             } catch is CancellationError {
@@ -1094,6 +1566,34 @@ final class ChatStore: ObservableObject {
     private func updateLaunchReadiness() {
         guard didLoadPersistedState, didPrepareLaunchModel else { return }
         isLaunchReady = true
+    }
+
+    private var launchPreparationModels: [String] {
+        AppSettings.normalizedModelList([resolvedDefaultModel])
+    }
+
+    private func markLaunchPreparationReady() {
+        let fallbackModels = availableModels.isEmpty
+            ? AppSettings.supportedModelIdentifiers
+            : availableModels
+
+        availableModels = fallbackModels
+        connectionState = .connected(fallbackModels)
+        didPrepareLaunchModel = true
+        updateLaunchReadiness()
+    }
+
+    private func startPostLaunchMetadataRefresh(generation: Int) {
+        postLaunchWarmupTask?.cancel()
+        postLaunchWarmupTask = Task { [weak self] in
+            guard let self else { return }
+
+            await self.reloadAvailableModels()
+
+            if self.launchPreparationGeneration == generation {
+                self.postLaunchWarmupTask = nil
+            }
+        }
     }
 
     private var compactionInstructions: String {
@@ -1259,6 +1759,75 @@ Use this as supporting context for turns that happened after the rolling memory 
         return lines.count > 1 ? lines.joined(separator: "\n") : nil
     }
 
+    private func assistantInstructions(baseInstructions: String, model: String) -> String {
+        var sections: [String] = []
+
+        if AppSettings.usesDirectOllamaAPI(model) {
+            sections.append(AppSettings.sharedAssistantIdentityInstructions)
+        }
+
+        if AppSettings.usesResponsesServer(model) {
+            sections.append(
+                """
+When the user asks about local weather, temperature, rain, snow, or forecasts for upcoming days, call the `\(WeatherService.forecastToolName)` tool instead of guessing.
+Use the tool result's `fetched_at`, `age_minutes`, and `is_stale` fields to decide whether you should briefly mention that the weather snapshot is a bit outdated.
+"""
+            )
+        } else if let fallbackForecastContext = weatherService.fallbackForecastContext() {
+            sections.append(fallbackForecastContext)
+        }
+
+        sections.append(baseInstructions)
+
+        return sections
+        .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        .joined(separator: "\n\n")
+    }
+
+    private func availableTools(for model: String) -> [ResponseFunctionToolDefinition] {
+        guard AppSettings.usesResponsesServer(model) else {
+            return []
+        }
+
+        return [weatherService.forecastTool]
+    }
+
+    private func toolOutputItems(for toolCalls: [ParsedResponseToolCall]) async -> [[String: Any]] {
+        var items: [[String: Any]] = []
+
+        for toolCall in toolCalls {
+            let output: String
+            switch toolCall.name {
+            case WeatherService.forecastToolName:
+                output = await weatherService.executeForecastTool(argumentsJSON: toolCall.argumentsJSON)
+            default:
+                output = #"{"status":"unavailable","reason":"That tool is not supported by the app."}"#
+            }
+
+            items.append([
+                "type": "function_call_output",
+                "call_id": toolCall.callID,
+                "output": output
+            ])
+        }
+
+        return items
+    }
+
+    private func resetAssistantStreamingMessage(in conversationID: UUID) {
+        guard let conversationIndex = indexForConversation(conversationID),
+              let messageIndex = conversations[conversationIndex].messages.lastIndex(where: { $0.role == .assistant && $0.state == .streaming }) else {
+            return
+        }
+
+        conversations[conversationIndex].messages[messageIndex].content = ""
+        conversations[conversationIndex].messages[messageIndex].thoughts = nil
+        conversations[conversationIndex].messages[messageIndex].isThoughtsStreaming = true
+        rawOutputBuffers[conversationID] = ""
+        rawThoughtBuffers[conversationID] = ""
+        touchConversation(at: conversationIndex)
+    }
+
     private func deduplicatedMessages(_ messages: [ChatMessage]) -> [ChatMessage] {
         var seen = Set<UUID>()
         return messages.filter { seen.insert($0.id).inserted }
@@ -1307,30 +1876,53 @@ Use this as supporting context for turns that happened after the rolling memory 
         )
     }
 
-    private func modelWarmupRequest() -> ResponsesAPIRequest {
+    private func modelWarmupRequest(model: String) -> ResponsesAPIRequest {
         let warmupMessage = ChatMessage(
             role: .user,
-            content: "Reply with exactly one word: ready."
+            content: "Reply with just the word ready."
         )
         return ResponsesAPIRequest(
             requestID: UUID().uuidString,
             baseURL: pinnedBaseURL,
             apiKey: settings.apiKey.nonEmpty,
-            model: AppSettings.fixedModelIdentifier,
+            model: model,
             reasoningEffort: .low,
-            temperature: 0.8,
+            temperature: 0.2,
             repeatPenalty: 0,
-            topP: AppSettings.defaultTopP,
-            maxOutputTokens: 1,
+            topP: 0.9,
+            // The gpt-oss responses server needs enough budget to finish a valid Harmony message.
+            maxOutputTokens: 64,
             instructions: nil,
             messages: [warmupMessage]
         )
+    }
+
+    private func prewarmLaunchModels(_ models: [String]) async throws {
+        let pendingModels = models.filter { !warmedLaunchModels.contains($0) }
+        guard !pendingModels.isEmpty else { return }
+
+        for model in pendingModels {
+            try Task.checkCancellation()
+
+            let request = modelWarmupRequest(model: model)
+            let stream = client.streamResponse(for: request)
+            for try await _ in stream {
+                try Task.checkCancellation()
+            }
+
+            warmedLaunchModels.insert(model)
+        }
     }
 }
 
 private struct PreparedConversationContext {
     let instructions: String
     let messages: [ChatMessage]
+}
+
+private struct AssistantReplyPlan {
+    let preparedContext: PreparedConversationContext
+    let request: ResponsesAPIRequest
 }
 
 private struct ConversationCompactionPlan {
@@ -1341,6 +1933,145 @@ private struct ConversationCompactionPlan {
 private struct SamplingProfile {
     let temperature: Double
     let topP: Double
+}
+
+private enum ReviewedStreamStage {
+    case primary
+    case reviewer
+}
+
+private struct ReviewedStageResult {
+    let transcript: ReviewedThoughtTranscript
+    let payload: ParsedResponsePayload
+}
+
+private struct ReviewedThoughtTranscript {
+    let primaryModelDisplayName: String
+    let reviewerModelDisplayName: String
+
+    private var primaryThoughts = ""
+    private var primaryResult = ""
+    private var reviewerThoughts = ""
+    private var reviewerResult = ""
+
+    init(primaryModelDisplayName: String, reviewerModelDisplayName: String) {
+        self.primaryModelDisplayName = primaryModelDisplayName
+        self.reviewerModelDisplayName = reviewerModelDisplayName
+    }
+
+    mutating func apply(_ event: ResponsesAPIStreamEvent, to stage: ReviewedStreamStage) {
+        switch event {
+        case .thoughtsDelta(let delta):
+            append(delta, to: stage, kind: .thoughts)
+        case .outputDelta(let delta):
+            append(delta, to: stage, kind: .result)
+        case .completed(let payload):
+            if let thoughts = payload.thoughts {
+                replace(thoughts, on: stage, kind: .thoughts)
+            }
+            if let finalText = payload.outputText.nonEmpty {
+                replace(finalText, on: stage, kind: .result)
+            }
+        }
+    }
+
+    mutating func reset(stage: ReviewedStreamStage) {
+        switch stage {
+        case .primary:
+            primaryThoughts = ""
+            primaryResult = ""
+        case .reviewer:
+            reviewerThoughts = ""
+            reviewerResult = ""
+        }
+    }
+
+    func payload(for stage: ReviewedStreamStage) -> ParsedResponsePayload {
+        switch stage {
+        case .primary:
+            return ParsedResponsePayload(
+                outputText: normalized(primaryResult) ?? "",
+                thoughts: normalized(primaryThoughts)
+            )
+        case .reviewer:
+            return ParsedResponsePayload(
+                outputText: normalized(reviewerResult) ?? "",
+                thoughts: normalized(reviewerThoughts)
+            )
+        }
+    }
+
+    var markdown: String? {
+        let sections = [
+            section(
+                title: "OSS Thoughts (\(primaryModelDisplayName))",
+                content: normalized(primaryThoughts)
+            ),
+            section(
+                title: "OSS Result (\(primaryModelDisplayName))",
+                content: normalized(primaryResult)
+            ),
+            section(
+                title: "Qwen Thoughts (\(reviewerModelDisplayName))",
+                content: normalized(reviewerThoughts)
+            ),
+            section(
+                title: "Qwen Result (\(reviewerModelDisplayName))",
+                content: normalized(reviewerResult)
+            )
+        ]
+        .compactMap { $0 }
+
+        guard !sections.isEmpty else {
+            return nil
+        }
+
+        return sections.joined(separator: "\n\n")
+    }
+
+    private enum SectionKind {
+        case thoughts
+        case result
+    }
+
+    private mutating func append(_ text: String, to stage: ReviewedStreamStage, kind: SectionKind) {
+        guard !text.isEmpty else { return }
+
+        switch (stage, kind) {
+        case (.primary, .thoughts):
+            primaryThoughts += text
+        case (.primary, .result):
+            primaryResult += text
+        case (.reviewer, .thoughts):
+            reviewerThoughts += text
+        case (.reviewer, .result):
+            reviewerResult += text
+        }
+    }
+
+    private mutating func replace(_ text: String, on stage: ReviewedStreamStage, kind: SectionKind) {
+        switch (stage, kind) {
+        case (.primary, .thoughts):
+            primaryThoughts = text
+        case (.primary, .result):
+            primaryResult = text
+        case (.reviewer, .thoughts):
+            reviewerThoughts = text
+        case (.reviewer, .result):
+            reviewerResult = text
+        }
+    }
+
+    private func section(title: String, content: String?) -> String? {
+        guard let content else { return nil }
+        return "### \(title)\n\n\(content)"
+    }
+
+    private func normalized(_ text: String) -> String? {
+        let sanitized = ModelOutputSanitizer.sanitize(text)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return sanitized.isEmpty ? nil : sanitized
+    }
 }
 
 private extension ChatMessage {
@@ -1407,6 +2138,29 @@ private extension String {
     }
 }
 
+private extension ResponsesAPIRequest {
+    func replacing(
+        requestID: String,
+        inputItems: [[String: Any]]
+    ) -> ResponsesAPIRequest {
+        ResponsesAPIRequest(
+            requestID: requestID,
+            baseURL: baseURL,
+            apiKey: apiKey,
+            model: model,
+            reasoningEffort: reasoningEffort,
+            temperature: temperature,
+            repeatPenalty: repeatPenalty,
+            topP: topP,
+            maxOutputTokens: maxOutputTokens,
+            instructions: instructions,
+            messages: messages,
+            inputItems: inputItems,
+            tools: tools
+        )
+    }
+}
+
 private enum AttachmentError: LocalizedError {
     case unsupportedFile(String)
     case unreadableText(String)
@@ -1428,31 +2182,35 @@ private enum AttachmentError: LocalizedError {
 }
 
 private actor LocalModelServer {
-    private static let modelReference = "gpt-oss:20b"
     private static let inferenceBackend = "ollama"
+    private static let ollamaWarmupTimeout: TimeInterval = 20
+    private static let ollamaLaunchTimeoutNanoseconds: UInt64 = 10_000_000_000
 
     private let session: URLSession
     private let fileManager = FileManager.default
     private let baseURL = URL(string: AppSettings.defaultBaseURL)!
     private let serverURL: URL
+    private let ollamaURL = URL(string: "http://127.0.0.1:11434/api/tags")!
     private let runtimeRootURL: URL
     private let workingDirectoryURL: URL
     private let pythonURL: URL
-    private let modelReference: String
 
     private var process: Process?
     private var outputPipe: Pipe?
     private var ownsProcess = false
     private var recentLogs = ""
+    private var currentModelReference = AppSettings.defaultModelIdentifier
 
     init(
         session: URLSession = .shared,
         sourceFilePath: String = #filePath
     ) {
+        let localFileManager = FileManager.default
+
         self.session = session
         self.serverURL = baseURL.appending(path: "responses")
 
-        let appSupportURL = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+        let appSupportURL = localFileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
             ?? URL(fileURLWithPath: NSHomeDirectory()).appending(path: "Library/Application Support", directoryHint: .isDirectory)
         self.runtimeRootURL = appSupportURL
             .appending(path: "llocust", directoryHint: .isDirectory)
@@ -1466,44 +2224,62 @@ private actor LocalModelServer {
             .deletingLastPathComponent()
         let defaultWorkingDirectoryURL = repositoryRoot.appending(path: "gpt-oss", directoryHint: .isDirectory)
 
+        let bundledRuntimeURL = runtimeRootURL.appending(path: "gpt-oss", directoryHint: .isDirectory)
         let configuredRuntimeURL: URL
         if let overridePath = ProcessInfo.processInfo.environment["LLOCUST_RUNTIME_ROOT"]?.trimmingCharacters(in: .whitespacesAndNewlines),
            !overridePath.isEmpty {
             configuredRuntimeURL = URL(fileURLWithPath: overridePath, isDirectory: true)
-        } else if fileManager.isExecutableFile(atPath: defaultWorkingDirectoryURL.appending(path: ".venv/bin/python").path) {
-            configuredRuntimeURL = defaultWorkingDirectoryURL
         } else {
-            configuredRuntimeURL = runtimeRootURL.appending(path: "gpt-oss", directoryHint: .isDirectory)
+            let runtimeCandidates = [defaultWorkingDirectoryURL, bundledRuntimeURL]
+            if let detectedRuntimeURL = runtimeCandidates.first(where: { Self.isUsableRuntime(at: $0, fileManager: localFileManager) }) {
+                configuredRuntimeURL = detectedRuntimeURL
+            } else if localFileManager.isExecutableFile(atPath: defaultWorkingDirectoryURL.appending(path: ".venv/bin/python").path) {
+                configuredRuntimeURL = defaultWorkingDirectoryURL
+            } else {
+                configuredRuntimeURL = bundledRuntimeURL
+            }
         }
 
         self.workingDirectoryURL = configuredRuntimeURL
         self.pythonURL = workingDirectoryURL.appending(path: ".venv/bin/python")
-        self.modelReference = Self.modelReference
 
-        if !fileManager.fileExists(atPath: workingDirectoryURL.path),
+        if !localFileManager.fileExists(atPath: workingDirectoryURL.path),
            !configuredRuntimeURL.standardizedFileURL.path.hasPrefix(defaultWorkingDirectoryURL.standardizedFileURL.path) {
             NSLog("llocust runtime missing at %@", workingDirectoryURL.path)
         }
     }
 
-    func ensureRunning() async throws {
+    private static func isUsableRuntime(at runtimeURL: URL, fileManager: FileManager) -> Bool {
+        let pythonURL = runtimeURL.appending(path: ".venv/bin/python")
+        let packageInitURL = runtimeURL.appending(path: "gpt_oss/__init__.py")
+        let serverModuleURL = runtimeURL.appending(path: "gpt_oss/responses_api/serve.py")
+
+        return fileManager.isExecutableFile(atPath: pythonURL.path)
+            && fileManager.fileExists(atPath: packageInitURL.path)
+            && fileManager.fileExists(atPath: serverModuleURL.path)
+    }
+
+    func ensureRunning(modelReference: String) async throws {
+        let normalizedModelReference = AppSettings.canonicalModelIdentifier(modelReference)
+        try await ensureOllamaServiceReady()
+
         if await isReachable() {
-            return
+            if !ownsProcess {
+                currentModelReference = normalizedModelReference
+                return
+            }
+
+            if currentModelReference == normalizedModelReference {
+                return
+            }
         }
 
-        if let process, process.isRunning {
+        if let process, process.isRunning, currentModelReference == normalizedModelReference {
             try await waitUntilReachableOrExit(process)
             return
         }
 
-        try validateRuntime()
-        try startProcess()
-
-        guard let process else {
-            throw LocalModelServerError.startupFailed("The local server could not be launched.")
-        }
-
-        try await waitUntilReachableOrExit(process)
+        try await forceRestart(modelReference: normalizedModelReference)
     }
 
     func stopIfNeeded() async {
@@ -1511,15 +2287,18 @@ private actor LocalModelServer {
         process.terminate()
     }
 
-    func forceRestart() async throws {
+    func forceRestart(modelReference: String) async throws {
+        let normalizedModelReference = AppSettings.canonicalModelIdentifier(modelReference)
+        try await ensureOllamaServiceReady()
+
         if ownsProcess, let process, process.isRunning {
             process.terminate()
         }
 
         handleProcessTermination()
         try terminateAnyServerListeningOnPort()
-        try validateRuntime()
-        try startProcess()
+        try validateRuntime(modelReference: normalizedModelReference)
+        try startProcess(modelReference: normalizedModelReference)
 
         guard let process else {
             throw LocalModelServerError.startupFailed("The local server could not be relaunched.")
@@ -1528,7 +2307,7 @@ private actor LocalModelServer {
         try await waitUntilReachableOrExit(process)
     }
 
-    private func validateRuntime() throws {
+    private func validateRuntime(modelReference: String) throws {
         guard fileManager.fileExists(atPath: workingDirectoryURL.path) else {
             throw LocalModelServerError.missingRuntime(workingDirectoryURL.path)
         }
@@ -1542,12 +2321,13 @@ private actor LocalModelServer {
         }
     }
 
-    private func startProcess() throws {
+    private func startProcess(modelReference: String) throws {
         let process = Process()
         let pipe = Pipe()
 
         recentLogs = ""
         ownsProcess = true
+        currentModelReference = modelReference
 
         process.executableURL = pythonURL
         process.currentDirectoryURL = workingDirectoryURL
@@ -1637,6 +2417,89 @@ private actor LocalModelServer {
         (200...299).contains(statusCode) || statusCode == 401 || statusCode == 403 || statusCode == 405
     }
 
+    private func ensureOllamaServiceReady() async throws {
+        guard Self.inferenceBackend == "ollama" else { return }
+
+        if await isOllamaReachable() {
+            return
+        }
+
+        try warmOllamaService()
+
+        let pollIntervalNanoseconds: UInt64 = 500_000_000
+        var waitedNanoseconds: UInt64 = 0
+
+        while waitedNanoseconds < Self.ollamaLaunchTimeoutNanoseconds {
+            if await isOllamaReachable() {
+                return
+            }
+
+            try await Task.sleep(nanoseconds: pollIntervalNanoseconds)
+            waitedNanoseconds += pollIntervalNanoseconds
+        }
+
+        throw LocalModelServerError.ollamaUnavailable(
+            "Start the Ollama app or run `ollama serve`, then try sending the message again."
+        )
+    }
+
+    private func isOllamaReachable() async -> Bool {
+        var request = URLRequest(url: ollamaURL)
+        request.httpMethod = "GET"
+        request.timeoutInterval = 2
+
+        do {
+            let (_, response) = try await session.data(for: request)
+            guard let httpResponse = response as? HTTPURLResponse else {
+                return false
+            }
+            return (200...299).contains(httpResponse.statusCode)
+        } catch {
+            return false
+        }
+    }
+
+    private func warmOllamaService() throws {
+        let process = Process()
+        let outputPipe = Pipe()
+        let semaphore = DispatchSemaphore(value: 0)
+
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = ["ollama", "list"]
+        process.currentDirectoryURL = workingDirectoryURL
+        process.standardOutput = outputPipe
+        process.standardError = outputPipe
+        process.terminationHandler = { _ in
+            semaphore.signal()
+        }
+
+        do {
+            try process.run()
+        } catch {
+            throw LocalModelServerError.ollamaUnavailable(
+                "The `ollama` command could not be launched automatically. Start the Ollama app or run `ollama serve`, then try again."
+            )
+        }
+
+        let timedOut = semaphore.wait(timeout: .now() + Self.ollamaWarmupTimeout) == .timedOut
+        if timedOut {
+            process.terminate()
+            _ = semaphore.wait(timeout: .now() + 2)
+        }
+
+        let outputData = outputPipe.fileHandleForReading.readDataToEndOfFile()
+        let output = String(decoding: outputData, as: UTF8.self)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if !output.isEmpty {
+            recentLogs += "\n[ollama]\n" + output
+            let maxCharacters = 8_000
+            if recentLogs.count > maxCharacters {
+                recentLogs = String(recentLogs.suffix(maxCharacters))
+            }
+        }
+    }
+
     private func appendLogs(_ chunk: String) {
         recentLogs += chunk
 
@@ -1650,6 +2513,7 @@ private actor LocalModelServer {
         outputPipe?.fileHandleForReading.readabilityHandler = nil
         outputPipe = nil
         process = nil
+        ownsProcess = false
     }
 
     private func recentLogSummary() -> String? {
@@ -1694,27 +2558,33 @@ private enum LocalModelServerError: LocalizedError {
     case missingRuntime(String)
     case missingPython(String)
     case missingCheckpoint(String)
+    case ollamaUnavailable(String?)
     case startupFailed(String?)
     case startupTimedOut(String?)
 
     var errorDescription: String? {
         switch self {
         case .missingRuntime(let path):
-            return "The local oss 20b runtime is not installed at \(path)."
+            return "The local model runtime is not installed at \(path)."
         case .missingPython(let path):
-            return "The local oss 20b runtime is missing its Python executable at \(path)."
+            return "The local model runtime is missing its Python executable at \(path)."
         case .missingCheckpoint(let path):
-            return "The local oss 20b Ollama model is unavailable: \(path)."
+            return "The selected Ollama model is unavailable: \(path)."
+        case .ollamaUnavailable(let details):
+            if let details, !details.isEmpty {
+                return "Ollama isn’t reachable on 127.0.0.1:11434.\n\n\(details)"
+            }
+            return "Ollama isn’t reachable on 127.0.0.1:11434. Start the Ollama app or run `ollama serve`, then try again."
         case .startupFailed(let logs):
             if let logs, !logs.isEmpty {
-                return "The local oss 20b server exited while starting.\n\n\(logs)"
+                return "The local model server exited while starting.\n\n\(logs)"
             }
-            return "The local oss 20b server exited while starting."
+            return "The local model server exited while starting."
         case .startupTimedOut(let logs):
             if let logs, !logs.isEmpty {
-                return "The local oss 20b server took too long to start.\n\n\(logs)"
+                return "The local model server took too long to start.\n\n\(logs)"
             }
-            return "The local oss 20b server took too long to start."
+            return "The local model server took too long to start."
         }
     }
 }

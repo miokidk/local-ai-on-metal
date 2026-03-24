@@ -26,6 +26,19 @@ enum ModelOutputSanitizer {
         "vq_"
     ]
 
+    private static let suppressedThoughtSignals = [
+        "according to policy",
+        "policy says",
+        "disallowed content",
+        "medical advice is disallowed",
+        "we must refuse",
+        "we should refuse",
+        "output a refusal",
+        "hence output a refusal",
+        "double-check:",
+        "the assistant should not provide"
+    ]
+
     static func sanitize(_ text: String) -> String {
         guard !text.isEmpty else { return text }
 
@@ -38,6 +51,15 @@ enum ModelOutputSanitizer {
             }
             sanitized = updated
         }
+    }
+
+    static func sanitizeThoughts(_ text: String) -> String {
+        let sanitized = sanitize(text)
+        guard !shouldSuppressThoughtTrace(sanitized) else {
+            return ""
+        }
+
+        return sanitized
     }
 
     private static func removingTrailingArtifact(from text: String) -> String {
@@ -86,5 +108,20 @@ enum ModelOutputSanitizer {
         }
 
         return lowered.range(of: #"^[a-z]{0,6}(?:_[0-9]{0,8})?$"#, options: .regularExpression) != nil
+    }
+
+    private static func shouldSuppressThoughtTrace(_ text: String) -> Bool {
+        let lowered = text.lowercased()
+        let matchCount = suppressedThoughtSignals.reduce(into: 0) { partialResult, signal in
+            if lowered.contains(signal) {
+                partialResult += 1
+            }
+        }
+
+        if matchCount >= 2 {
+            return true
+        }
+
+        return lowered.hasPrefix("the user asks:") && matchCount >= 1
     }
 }

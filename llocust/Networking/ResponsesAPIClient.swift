@@ -32,6 +32,38 @@ struct ResponsesAPIRequest {
     let maxOutputTokens: Int?
     let instructions: String?
     let messages: [ChatMessage]
+    let inputItems: [[String: Any]]
+    let tools: [ResponseFunctionToolDefinition]
+
+    init(
+        requestID: String,
+        baseURL: URL,
+        apiKey: String?,
+        model: String,
+        reasoningEffort: ReasoningEffort,
+        temperature: Double,
+        repeatPenalty: Double,
+        topP: Double,
+        maxOutputTokens: Int?,
+        instructions: String?,
+        messages: [ChatMessage],
+        inputItems: [[String: Any]] = [],
+        tools: [ResponseFunctionToolDefinition] = []
+    ) {
+        self.requestID = requestID
+        self.baseURL = baseURL
+        self.apiKey = apiKey
+        self.model = model
+        self.reasoningEffort = reasoningEffort
+        self.temperature = temperature
+        self.repeatPenalty = repeatPenalty
+        self.topP = topP
+        self.maxOutputTokens = maxOutputTokens
+        self.instructions = instructions
+        self.messages = messages
+        self.inputItems = inputItems
+        self.tools = tools
+    }
 }
 
 struct ResponsesServerMetadata {
@@ -42,7 +74,7 @@ struct ResponsesServerMetadata {
 enum ResponsesAPIStreamEvent {
     case thoughtsDelta(String)
     case outputDelta(String)
-    case completed(finalText: String?, thoughts: String?)
+    case completed(ParsedResponsePayload)
 }
 
 final class ResponsesAPIClient {
@@ -53,6 +85,10 @@ final class ResponsesAPIClient {
     }
 
     func completeResponse(for request: ResponsesAPIRequest) async throws -> ParsedResponsePayload {
+        if AppSettings.usesDirectOllamaAPI(request.model) {
+            return try await completeOllamaChatResponse(for: request)
+        }
+
         let urlRequest = try makeURLRequest(for: request, streaming: false)
         let data: Data
         let response: URLResponse
@@ -71,7 +107,11 @@ final class ResponsesAPIClient {
         AsyncThrowingStream { continuation in
             let task = Task {
                 do {
-                    try await self.executeStreamingRequest(request, continuation: continuation)
+                    if AppSettings.usesDirectOllamaAPI(request.model) {
+                        try await self.executeOllamaStreamingRequest(request, continuation: continuation)
+                    } else {
+                        try await self.executeStreamingRequest(request, continuation: continuation)
+                    }
                 } catch is CancellationError {
                     continuation.finish()
                 } catch {
@@ -148,23 +188,61 @@ final class ResponsesAPIClient {
                 }
             }
         } catch {
-            if let translated = error as? ResponsesAPIError {
-                throw translated
+            if case ResponsesAPIError.serverUnavailable = error {
+                throw error
             }
         }
 
-        let ollamaRequest = try makeModelsRequest(baseURL: strippedBaseURL(baseURL), apiKey: apiKey, path: "api/tags")
-        let (data, response) = try await session.data(for: ollamaRequest)
-        try validate(response: response, data: data)
+        for ollamaBaseURL in ollamaBaseURLs(from: baseURL) {
+            do {
+                let ollamaRequest = try makeModelsRequest(baseURL: ollamaBaseURL, apiKey: apiKey, path: "api/tags")
+                let (data, response) = try await session.data(for: ollamaRequest)
+                try validate(response: response, data: data)
 
-        if
-            let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-            let models = object["models"] as? [[String: Any]]
-        {
-            return models.compactMap { ($0["name"] as? String) ?? ($0["model"] as? String) }
+                if
+                    let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                    let models = object["models"] as? [[String: Any]]
+                {
+                    let discoveredModels = models.compactMap { ($0["name"] as? String) ?? ($0["model"] as? String) }
+                    if !discoveredModels.isEmpty {
+                        return discoveredModels
+                    }
+                }
+            } catch {
+                continue
+            }
         }
 
         return []
+    }
+
+    private func completeOllamaChatResponse(for request: ResponsesAPIRequest) async throws -> ParsedResponsePayload {
+        let urlRequest = try makeOllamaChatRequest(for: request, streaming: false)
+        let data: Data
+        let response: URLResponse
+
+        do {
+            (data, response) = try await session.data(for: urlRequest)
+        } catch let error as URLError {
+            throw translated(urlError: error)
+        }
+
+        try validate(response: response, data: data)
+
+        guard
+            let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+            let message = object["message"] as? [String: Any]
+        else {
+            throw ResponsesAPIError.malformedResponse
+        }
+
+        let outputText = (message["content"] as? String) ?? ""
+        let thoughts = (message["thinking"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return ParsedResponsePayload(
+            outputText: ModelOutputSanitizer.sanitize(outputText),
+            thoughts: thoughts?.isEmpty == true ? nil : ModelOutputSanitizer.sanitize(thoughts ?? "")
+        )
     }
 
     private func executeStreamingRequest(
@@ -196,9 +274,107 @@ final class ResponsesAPIClient {
         } else {
             let data = try await collectData(from: bytes)
             let parsed = try ResponsesPayloadParser.parseResponse(data: data)
-            continuation.yield(.completed(finalText: parsed.outputText.nonEmpty, thoughts: parsed.thoughts))
+            continuation.yield(.completed(parsed))
             continuation.finish()
         }
+    }
+
+    private func executeOllamaStreamingRequest(
+        _ request: ResponsesAPIRequest,
+        continuation: AsyncThrowingStream<ResponsesAPIStreamEvent, Error>.Continuation
+    ) async throws {
+        let urlRequest = try makeOllamaChatRequest(for: request, streaming: true)
+        let (bytes, response): (URLSession.AsyncBytes, URLResponse)
+
+        do {
+            (bytes, response) = try await session.bytes(for: urlRequest)
+        } catch let error as URLError {
+            throw translated(urlError: error)
+        }
+
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw ResponsesAPIError.malformedResponse
+        }
+
+        if !(200...299).contains(httpResponse.statusCode) {
+            let data = try await collectData(from: bytes)
+            let message = errorMessage(from: data) ?? HTTPURLResponse.localizedString(forStatusCode: httpResponse.statusCode)
+            throw ResponsesAPIError.server(status: httpResponse.statusCode, message: message)
+        }
+
+        var finalText = ""
+        var finalThoughts = ""
+        var sawCompletionMarker = false
+
+        do {
+            for try await line in bytes.lines {
+                if Task.isCancelled {
+                    throw CancellationError()
+                }
+
+                let trimmedLine = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trimmedLine.isEmpty,
+                      let data = trimmedLine.data(using: .utf8),
+                      let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+                else {
+                    continue
+                }
+
+                if
+                    let message = object["message"] as? [String: Any],
+                    let thinking = (message["thinking"] as? String)?.trimmingCharacters(in: .newlines),
+                    !thinking.isEmpty
+                {
+                    finalThoughts += thinking
+                    continuation.yield(.thoughtsDelta(thinking))
+                }
+
+                if
+                    let message = object["message"] as? [String: Any],
+                    let delta = (message["content"] as? String)?.trimmingCharacters(in: .newlines),
+                    !delta.isEmpty
+                {
+                    finalText += delta
+                    continuation.yield(.outputDelta(delta))
+                }
+
+                if (object["done"] as? Bool) == true {
+                    sawCompletionMarker = true
+                    continuation.yield(
+                        .completed(
+                            ParsedResponsePayload(
+                                outputText: finalText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "" : ModelOutputSanitizer.sanitize(finalText),
+                                thoughts: finalThoughts.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : ModelOutputSanitizer.sanitize(finalThoughts)
+                            )
+                        )
+                    )
+                    continuation.finish()
+                    return
+                }
+            }
+        } catch let error as URLError {
+            throw translated(urlError: error)
+        } catch {
+            throw error
+        }
+
+        if !sawCompletionMarker,
+           finalText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+           finalThoughts.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            throw ResponsesAPIError.serverUnavailable(
+                "Ollama ended the streamed reply before returning any assistant text. Make sure Ollama is running and try again."
+            )
+        }
+
+        continuation.yield(
+            .completed(
+                ParsedResponsePayload(
+                    outputText: finalText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "" : ModelOutputSanitizer.sanitize(finalText),
+                    thoughts: finalThoughts.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : ModelOutputSanitizer.sanitize(finalThoughts)
+                )
+            )
+        )
+        continuation.finish()
     }
 
     private func makeURLRequest(for request: ResponsesAPIRequest, streaming: Bool) throws -> URLRequest {
@@ -215,7 +391,7 @@ final class ResponsesAPIClient {
             urlRequest.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         }
 
-        let input = request.messages.compactMap { message -> [String: Any]? in
+        var input = request.messages.compactMap { message -> [String: Any]? in
             var contentItems: [[String: Any]] = []
             let contentType = message.role == .user ? "input_text" : "output_text"
 
@@ -240,6 +416,7 @@ final class ResponsesAPIClient {
                 "content": contentItems
             ]
         }
+        input.append(contentsOf: request.inputItems)
 
         let payload: [String: Any] = [
             "model": request.model,
@@ -260,8 +437,36 @@ final class ResponsesAPIClient {
         if let maxOutputTokens = request.maxOutputTokens {
             finalizedPayload["max_output_tokens"] = maxOutputTokens
         }
+        if !request.tools.isEmpty {
+            finalizedPayload["tools"] = request.tools.map(\.payload)
+        }
 
         urlRequest.httpBody = try JSONSerialization.data(withJSONObject: finalizedPayload, options: [])
+        return urlRequest
+    }
+
+    private func makeOllamaChatRequest(for request: ResponsesAPIRequest, streaming: Bool) throws -> URLRequest {
+        let endpoint = preferredOllamaBaseURL(from: request.baseURL).appending(path: "api/chat")
+        var urlRequest = URLRequest(url: endpoint)
+        urlRequest.httpMethod = "POST"
+        urlRequest.timeoutInterval = 180
+        urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        urlRequest.setValue("application/json", forHTTPHeaderField: "Accept")
+
+        let messages = ollamaMessages(for: request)
+        let payload: [String: Any] = [
+            "model": request.model,
+            "messages": messages,
+            "stream": streaming,
+            "think": ollamaThinkingValue(for: request),
+            "options": [
+                "temperature": request.temperature,
+                "top_p": request.topP,
+                "repeat_penalty": 1.0 + max(0.0, request.repeatPenalty)
+            ]
+        ]
+
+        urlRequest.httpBody = try JSONSerialization.data(withJSONObject: payload, options: [])
         return urlRequest
     }
 
@@ -285,6 +490,9 @@ final class ResponsesAPIClient {
     ) async throws {
         var currentEventName: String?
         var currentDataLines: [String] = []
+        var sawAnyPayload = false
+        var sawAssistantContent = false
+        var sawCompletedEvent = false
 
         func flushEvent() {
             defer {
@@ -295,19 +503,30 @@ final class ResponsesAPIClient {
             guard !currentDataLines.isEmpty else { return }
             let payload = currentDataLines.joined(separator: "\n")
             guard payload != "[DONE]" else {
-                continuation.finish()
                 return
             }
             guard let data = payload.data(using: .utf8) else { return }
+            sawAnyPayload = true
+
+            let loweredEventName = (currentEventName ?? "").lowercased()
+            if loweredEventName == "response.completed" {
+                sawCompletedEvent = true
+            }
 
             for item in ResponsesPayloadParser.parseStreamingEvent(data: data, eventName: currentEventName) {
                 switch item {
                 case .thoughtsDelta(let delta):
+                    sawAssistantContent = true
                     continuation.yield(.thoughtsDelta(delta))
                 case .outputDelta(let delta):
+                    sawAssistantContent = true
                     continuation.yield(.outputDelta(delta))
-                case .completed(let finalText, let thoughts):
-                    continuation.yield(.completed(finalText: finalText, thoughts: thoughts))
+                case .completed(let payload):
+                    sawCompletedEvent = true
+                    if payload.outputText.nonEmpty != nil || payload.thoughts != nil || !payload.toolCalls.isEmpty {
+                        sawAssistantContent = true
+                    }
+                    continuation.yield(.completed(payload))
                 }
             }
         }
@@ -337,12 +556,26 @@ final class ResponsesAPIClient {
                 }
             }
             flushEvent()
-            continuation.finish()
         } catch let error as URLError {
             throw translated(urlError: error)
         } catch {
             throw error
         }
+
+        if sawCompletedEvent || sawAssistantContent {
+            continuation.finish()
+            return
+        }
+
+        if sawAnyPayload {
+            throw ResponsesAPIError.serverUnavailable(
+                "The local model backend stopped the reply stream before returning any assistant text. Make sure Ollama is running and try again."
+            )
+        }
+
+        throw ResponsesAPIError.serverUnavailable(
+            "The local server closed the reply stream without returning any events."
+        )
     }
 
     private func collectData(from bytes: URLSession.AsyncBytes) async throws -> Data {
@@ -455,6 +688,59 @@ final class ResponsesAPIClient {
             components.path = String(components.path.dropLast(3))
         }
         return components.url ?? baseURL
+    }
+
+    private func ollamaBaseURLs(from baseURL: URL) -> [URL] {
+        let fallbacks = [
+            URL(string: "http://127.0.0.1:11434"),
+            URL(string: "http://localhost:11434"),
+            strippedBaseURL(baseURL)
+        ]
+
+        var seen = Set<String>()
+        return fallbacks.compactMap { candidate in
+            guard let candidate else { return nil }
+            let normalized = candidate.absoluteString.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            guard seen.insert(normalized).inserted else { return nil }
+            return URL(string: normalized) ?? candidate
+        }
+    }
+
+    private func preferredOllamaBaseURL(from baseURL: URL) -> URL {
+        ollamaBaseURLs(from: baseURL).first ?? baseURL
+    }
+
+    private func ollamaMessages(for request: ResponsesAPIRequest) -> [[String: String]] {
+        var messages: [[String: String]] = []
+
+        if let instructions = request.instructions?.trimmingCharacters(in: .whitespacesAndNewlines), !instructions.isEmpty {
+            messages.append([
+                "role": "system",
+                "content": instructions
+            ])
+        }
+
+        for message in request.messages {
+            let parts = ([message.trimmedContent] + message.attachments.map(\.modelInputText))
+                .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+            guard !parts.isEmpty else { continue }
+
+            messages.append([
+                "role": message.role.rawValue,
+                "content": parts.joined(separator: "\n\n")
+            ])
+        }
+
+        return messages
+    }
+
+    private func ollamaThinkingValue(for request: ResponsesAPIRequest) -> Bool {
+        switch request.reasoningEffort {
+        case .low:
+            return false
+        case .medium, .high:
+            return true
+        }
     }
 
     private func translated(urlError: URLError) -> ResponsesAPIError {

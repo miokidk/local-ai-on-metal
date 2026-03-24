@@ -25,7 +25,7 @@ struct ExpandingTextView: NSViewRepresentable {
         textView.importsGraphics = false
         textView.isAutomaticQuoteSubstitutionEnabled = false
         textView.isAutomaticDashSubstitutionEnabled = false
-        textView.font = .systemFont(ofSize: 17)
+        textView.applyTypography()
         textView.textContainerInset = NSSize(width: 0, height: 4)
         textView.textContainer?.lineFragmentPadding = 0
         textView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
@@ -50,6 +50,7 @@ struct ExpandingTextView: NSViewRepresentable {
         }
 
         textView.onSubmit = onSubmit
+        textView.applyTypography()
 
         if isFocused, scrollView.window?.firstResponder !== textView {
             DispatchQueue.main.async {
@@ -86,6 +87,28 @@ struct ExpandingTextView: NSViewRepresentable {
 
 final class ComposerTextView: NSTextView {
     var onSubmit: (() -> Void)?
+
+    func applyTypography() {
+        let paragraphStyle = AppTypography.composerParagraphStyle()
+        let font = AppTypography.composerFont(size: AppTypography.composerSize, weight: AppTypography.composerWeight)
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: font,
+            .kern: AppTypography.composerTracking,
+            .paragraphStyle: paragraphStyle,
+            .foregroundColor: NSColor.labelColor
+        ]
+
+        self.font = font
+        defaultParagraphStyle = paragraphStyle
+        typingAttributes = attributes
+
+        guard let textStorage else { return }
+        let selectedRange = selectedRange()
+        textStorage.beginEditing()
+        textStorage.setAttributes(attributes, range: NSRange(location: 0, length: textStorage.length))
+        textStorage.endEditing()
+        setSelectedRange(selectedRange)
+    }
 
     override func keyDown(with event: NSEvent) {
         let isReturnKey = event.keyCode == 36 || event.keyCode == 76

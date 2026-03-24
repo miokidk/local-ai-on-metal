@@ -17,6 +17,10 @@ struct ConversationDetailView: View {
                     get: { store.settings.selectedReasoningEffort },
                     set: { store.settings.selectedReasoningEffort = $0 }
                 ),
+                selectedResponseMode: Binding(
+                    get: { store.settings.selectedResponseMode },
+                    set: { store.settings.selectedResponseMode = $0 }
+                ),
                 isStreaming: store.isStreaming(conversationID: conversation?.id),
                 onAddAttachment: store.addDraftAttachments,
                 onRemoveAttachment: store.removeDraftAttachment(_:),
@@ -65,7 +69,7 @@ struct ConversationDetailView: View {
             HStack(spacing: 10) {
                 ProgressView()
                     .controlSize(.small)
-                Text("Starting oss 20b…")
+                Text("Starting \(store.settings.modelDisplayName)…")
                     .font(.system(size: 12, weight: .medium))
                     .foregroundStyle(.secondary)
                 Spacer()

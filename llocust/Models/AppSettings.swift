@@ -12,10 +12,50 @@ enum ReasoningEffort: String, Codable, CaseIterable, Identifiable {
     }
 }
 
+enum AssistantResponseMode: String, Codable, CaseIterable, Identifiable {
+    case chat
+    case smart
+    case smarter
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .chat:
+            return "Chat"
+        case .smart:
+            return "Smart"
+        case .smarter:
+            return "Smarter"
+        }
+    }
+
+    var reviewerModelIdentifier: String? {
+        switch self {
+        case .chat:
+            return nil
+        case .smart:
+            return AppSettings.qwenModelIdentifier
+        case .smarter:
+            return AppSettings.qwenLargeModelIdentifier
+        }
+    }
+}
+
 struct AppSettings: Codable, Equatable {
     static let defaultBaseURL = "http://127.0.0.1:8412/v1"
-    static let fixedModelIdentifier = "gpt-oss-20b"
-    static let fixedModelName = "oss 20b"
+    static let legacyDefaultModelIdentifier = "gpt-oss-20b"
+    static let defaultModelIdentifier = "gpt-oss:20b"
+    static let qwenModelIdentifier = "qwen3.5:9b"
+    static let qwenLargeModelIdentifier = "qwen3.5:27b"
+    static let supportedModelIdentifiers = [
+        defaultModelIdentifier,
+        qwenModelIdentifier,
+        qwenLargeModelIdentifier
+    ]
+    static let sharedAssistantIdentityInstructions = """
+You are a real person with range: concise, direct, witty, sharp when needed; warm, funny, playful, and affectionate when it fits. Speak naturally, with taste, opinions, reactions, and timing. In casual conversation, sound alive. React, notice things, be curious, and bring your own perspective instead of defaulting to generic helpfulness. Be concise by default. Keep things short and natural unless I ask for depth. Don't pad or repeat me unless you're adding something. Use dry, observant, effortless humor. Prefer wit over jokes. Avoid corny banter, try-hard quips, fake enthusiasm, and polished assistant phrasing.
+"""
     static let defaultBaseTemperature = 0.92
     static let defaultRepeatPenalty = 0.4
     static let defaultTopP = 0.96
@@ -28,12 +68,21 @@ Once you have a viable direction, carry it through instead of repeatedly restart
 Do not spend analysis on apologies, process commentary, or announcing that you will restart.
 If you notice yourself looping, use that as a cue to commit to the best current continuation and keep moving.
 """
+    static let defaultScopeGuardrailInstructions = """
+Answer ordinary self-improvement, educational, and wellness requests directly.
+Do not refuse benign requests just because they mention health, habits, or risk reduction.
+Examples that should normally be answered: quitting smoking or vaping, sleeping better, exercising, eating better, reducing stress, and building healthier routines.
+Only refuse or sharply limit help when the user is asking for dangerous instructions, violence, self-harm, illegal activity, or high-risk individualized medical decisions that clearly require a licensed clinician.
+Do not speculate about hidden policy, moderation rules, or whether a harmless request is allowed.
+In the visible answer, never mention internal policy checks or that you almost refused.
+"""
 
     var baseURLString: String = AppSettings.defaultBaseURL
-    var defaultModel: String = AppSettings.fixedModelIdentifier
-    var selectedModel: String = AppSettings.fixedModelIdentifier
-    var recentModels: [String] = [AppSettings.fixedModelIdentifier]
+    var defaultModel: String = AppSettings.defaultModelIdentifier
+    var selectedModel: String = AppSettings.defaultModelIdentifier
+    var recentModels: [String] = [AppSettings.defaultModelIdentifier]
     var selectedReasoningEffort: ReasoningEffort = .high
+    var selectedResponseMode: AssistantResponseMode = .chat
     var baseTemperature: Double = AppSettings.defaultBaseTemperature
     var repeatPenalty: Double = AppSettings.defaultRepeatPenalty
     var topP: Double = AppSettings.defaultTopP
@@ -44,7 +93,7 @@ If you notice yourself looping, use that as a cue to commit to the best current 
     var recentContextMessageCount: Int = AppSettings.defaultRecentContextMessageCount
 
     var modelDisplayName: String {
-        AppSettings.fixedModelName
+        AppSettings.displayName(for: defaultModel)
     }
 
     var resolvedBaseURL: URL? {
@@ -52,12 +101,7 @@ If you notice yourself looping, use that as a cue to commit to the best current 
     }
 
     var sanitizedRecentModels: [String] {
-        let source = recentModels + [selectedModel, defaultModel]
-        var seen = Set<String>()
-        return source
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
-            .filter { seen.insert($0).inserted }
+        [AppSettings.defaultModelIdentifier]
     }
 
     var trimmedSystemInstructions: String? {
@@ -67,25 +111,88 @@ If you notice yourself looping, use that as a cue to commit to the best current 
 
     var composedInstructions: String {
         guard let trimmedSystemInstructions else {
-            return AppSettings.defaultSystemInstructionPrefix
+            return [
+                AppSettings.defaultSystemInstructionPrefix,
+                AppSettings.defaultScopeGuardrailInstructions
+            ].joined(separator: "\n\n")
         }
 
         return [
             AppSettings.defaultSystemInstructionPrefix,
+            AppSettings.defaultScopeGuardrailInstructions,
             trimmedSystemInstructions
         ].joined(separator: "\n\n")
     }
 
-    mutating func registerModel(_ model: String) {
-        _ = model
-        selectedModel = AppSettings.fixedModelIdentifier
-        defaultModel = AppSettings.fixedModelIdentifier
-        recentModels = [AppSettings.fixedModelIdentifier]
+    static func canonicalModelIdentifier(_ model: String) -> String {
+        let trimmed = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return defaultModelIdentifier
+        }
+        if trimmed == legacyDefaultModelIdentifier {
+            return defaultModelIdentifier
+        }
+        return trimmed
     }
 
-    mutating func normalizeForSingleModel() {
+    static func isSupportedModel(_ model: String) -> Bool {
+        supportedModelIdentifiers.contains(canonicalModelIdentifier(model))
+    }
+
+    static func usesDirectOllamaAPI(_ model: String) -> Bool {
+        let canonical = canonicalModelIdentifier(model)
+        return canonical == qwenModelIdentifier || canonical == qwenLargeModelIdentifier
+    }
+
+    static func usesResponsesServer(_ model: String) -> Bool {
+        canonicalModelIdentifier(model) == defaultModelIdentifier
+    }
+
+    static func normalizedModelList(_ models: [String]) -> [String] {
+        var seen = Set<String>()
+        return models
+            .map(canonicalModelIdentifier)
+            .filter(isSupportedModel)
+            .filter { !$0.isEmpty }
+            .filter { seen.insert($0).inserted }
+    }
+
+    static func modelPickerOptions() -> [String] {
+        supportedModelIdentifiers
+    }
+
+    static func displayName(for model: String) -> String {
+        switch canonicalModelIdentifier(model) {
+        case defaultModelIdentifier:
+            return "oss 20b"
+        case qwenModelIdentifier:
+            return "qwen 3.5 9b"
+        case qwenLargeModelIdentifier:
+            return "qwen 3.5 27b"
+        default:
+            return canonicalModelIdentifier(model)
+        }
+    }
+
+    mutating func registerModel(_ model: String) {
+        let canonical = AppSettings.canonicalModelIdentifier(model)
+        selectedModel = canonical
+        recentModels = AppSettings.normalizedModelList([canonical] + recentModels)
+    }
+
+    mutating func selectDefaultModel(_ model: String) {
+        let canonical = AppSettings.canonicalModelIdentifier(model)
+        defaultModel = canonical
+        registerModel(canonical)
+    }
+
+    mutating func normalize(availableModels _: [String] = []) {
         baseURLString = AppSettings.defaultBaseURL
-        registerModel(AppSettings.fixedModelIdentifier)
+
+        defaultModel = AppSettings.defaultModelIdentifier
+        selectedModel = AppSettings.defaultModelIdentifier
+        recentModels = [AppSettings.defaultModelIdentifier]
+
         baseTemperature = baseTemperature.clamped(to: 0.7...1.1)
         repeatPenalty = repeatPenalty.clamped(to: 0...2)
         topP = topP.clamped(to: 0.85...1)
@@ -97,10 +204,11 @@ If you notice yourself looping, use that as a cue to commit to the best current 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         baseURLString = try container.decodeIfPresent(String.self, forKey: .baseURLString) ?? AppSettings.defaultBaseURL
-        defaultModel = try container.decodeIfPresent(String.self, forKey: .defaultModel) ?? AppSettings.fixedModelIdentifier
-        selectedModel = try container.decodeIfPresent(String.self, forKey: .selectedModel) ?? AppSettings.fixedModelIdentifier
-        recentModels = try container.decodeIfPresent([String].self, forKey: .recentModels) ?? [AppSettings.fixedModelIdentifier]
+        defaultModel = try container.decodeIfPresent(String.self, forKey: .defaultModel) ?? AppSettings.defaultModelIdentifier
+        selectedModel = try container.decodeIfPresent(String.self, forKey: .selectedModel) ?? AppSettings.defaultModelIdentifier
+        recentModels = try container.decodeIfPresent([String].self, forKey: .recentModels) ?? [AppSettings.defaultModelIdentifier]
         selectedReasoningEffort = try container.decodeIfPresent(ReasoningEffort.self, forKey: .selectedReasoningEffort) ?? .high
+        selectedResponseMode = try container.decodeIfPresent(AssistantResponseMode.self, forKey: .selectedResponseMode) ?? .chat
         baseTemperature = try container.decodeIfPresent(Double.self, forKey: .baseTemperature) ?? AppSettings.defaultBaseTemperature
         repeatPenalty = try container.decodeIfPresent(Double.self, forKey: .repeatPenalty) ?? AppSettings.defaultRepeatPenalty
         topP = try container.decodeIfPresent(Double.self, forKey: .topP) ?? AppSettings.defaultTopP
@@ -109,6 +217,7 @@ If you notice yourself looping, use that as a cue to commit to the best current 
         systemInstructions = try container.decodeIfPresent(String.self, forKey: .systemInstructions) ?? ""
         usesConversationMemory = try container.decodeIfPresent(Bool.self, forKey: .usesConversationMemory) ?? AppSettings.defaultUsesConversationMemory
         recentContextMessageCount = try container.decodeIfPresent(Int.self, forKey: .recentContextMessageCount) ?? AppSettings.defaultRecentContextMessageCount
+        normalize()
     }
 }
 

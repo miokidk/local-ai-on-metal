@@ -1,4 +1,36 @@
+import AppKit
 import SwiftUI
+
+enum AppTypography {
+    static func readingFont(size: CGFloat, weight: Font.Weight = .regular) -> Font {
+        .system(size: size, weight: weight, design: .rounded)
+    }
+
+    static func composerFont(size: CGFloat, weight: NSFont.Weight = .regular) -> NSFont {
+        let baseFont = NSFont.systemFont(ofSize: size, weight: weight)
+        guard let descriptor = baseFont.fontDescriptor.withDesign(.rounded) else {
+            return baseFont
+        }
+
+        return NSFont(descriptor: descriptor, size: size) ?? baseFont
+    }
+
+    static func composerParagraphStyle() -> NSParagraphStyle {
+        let style = NSMutableParagraphStyle()
+        style.lineHeightMultiple = 1.28
+        return style
+    }
+
+    static let standardBodySize: CGFloat = 17
+    static let subduedBodySize: CGFloat = 15
+    static let standardBodyLineSpacing: CGFloat = 11
+    static let subduedBodyLineSpacing: CGFloat = 10
+    static let bodyTracking: CGFloat = 0.15
+    static let composerSize: CGFloat = 18
+    static let composerTracking: CGFloat = 0.2
+    static let bodyWeight: Font.Weight = .regular
+    static let composerWeight: NSFont.Weight = .regular
+}
 
 struct MarkdownTextView: View {
     enum Style {
@@ -44,7 +76,7 @@ private struct MarkdownBlockRow: View {
     var body: some View {
         switch block.kind {
         case .heading(let level, let text):
-            MarkdownInlineText(text: text, font: context.headingFont(for: level), context: context)
+            MarkdownHeadingView(level: level, text: text, context: context)
         case .paragraph(let text):
             MarkdownInlineText(text: text, font: context.bodyFont, context: context)
         case .list(let list):
@@ -91,6 +123,10 @@ private struct MarkdownInlineText: View {
     let text: String
     let font: Font
     let context: MarkdownRenderContext
+    var tracking: CGFloat? = nil
+    var lineSpacing: CGFloat? = nil
+    var textAlignment: TextAlignment = .leading
+    var fillsWidthOverride: Bool? = nil
 
     var body: some View {
         Group {
@@ -107,10 +143,31 @@ private struct MarkdownInlineText: View {
             }
         }
         .font(font)
+        .tracking(tracking ?? context.bodyTracking)
+        .lineSpacing(lineSpacing ?? context.lineSpacing)
+        .multilineTextAlignment(textAlignment)
         .foregroundStyle(context.primaryForegroundStyle)
         .textSelection(.enabled)
         .fixedSize(horizontal: false, vertical: true)
-        .modifier(FillWidthModifier(isEnabled: context.fillsWidth))
+        .modifier(FillWidthModifier(isEnabled: fillsWidthOverride ?? context.fillsWidth))
+    }
+}
+
+private struct MarkdownHeadingView: View {
+    let level: Int
+    let text: String
+    let context: MarkdownRenderContext
+
+    var body: some View {
+        MarkdownInlineText(
+            text: text,
+            font: context.headingFont(for: level),
+            context: context,
+            tracking: context.headingTracking(for: level),
+            lineSpacing: context.headingLineSpacing(for: level)
+        )
+        .padding(.top, context.headingTopPadding(for: level))
+        .padding(.bottom, context.headingBottomPadding(for: level))
     }
 }
 
@@ -185,44 +242,46 @@ private struct MarkdownTableView: View {
     }
 
     var body: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            VStack(spacing: 0) {
-                rowView(cells: padded(table.headers), isHeader: true, rowIndex: 0)
+        VStack(spacing: 0) {
+            rowView(cells: padded(table.headers), isHeader: true)
 
-                ForEach(Array(table.rows.enumerated()), id: \.offset) { index, row in
-                    Divider()
-                    rowView(cells: padded(row), isHeader: false, rowIndex: index + 1)
+            if !table.rows.isEmpty {
+                horizontalRule
+            }
+
+            ForEach(Array(table.rows.enumerated()), id: \.offset) { index, row in
+                rowView(cells: padded(row), isHeader: false)
+
+                if index < table.rows.count - 1 {
+                    horizontalRule
                 }
             }
-            .background(
-                RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .fill(Color.black.opacity(context.style == .subdued ? 0.025 : 0.035))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .stroke(Color.secondary.opacity(0.18), lineWidth: 1)
-            )
         }
+        .modifier(FillWidthModifier(isEnabled: context.fillsWidth))
     }
 
-    private func rowView(cells: [String], isHeader: Bool, rowIndex: Int) -> some View {
+    private func rowView(cells: [String], isHeader: Bool) -> some View {
         HStack(spacing: 0) {
             ForEach(Array(cells.enumerated()), id: \.offset) { column, cell in
                 MarkdownInlineText(
                     text: cell,
                     font: isHeader ? context.tableHeaderFont : context.bodyFont,
-                    context: context
+                    context: context,
+                    tracking: isHeader ? context.tableHeaderTracking : context.bodyTracking,
+                    lineSpacing: isHeader ? context.tableHeaderLineSpacing : context.lineSpacing,
+                    textAlignment: textAlignment(for: table.alignment(at: column)),
+                    fillsWidthOverride: true
                 )
-                .frame(minWidth: 120, alignment: alignment(for: table.alignment(at: column)))
-                .padding(.horizontal, 12)
-                .padding(.vertical, 10)
-                .background(backgroundColor(isHeader: isHeader, rowIndex: rowIndex))
+                .frame(minWidth: 0, maxWidth: .infinity, alignment: alignment(for: table.alignment(at: column)))
+                .padding(.horizontal, isHeader ? 10 : 12)
+                .padding(.vertical, isHeader ? 12 : 14)
 
                 if column < cells.count - 1 {
-                    Divider()
+                    verticalRule
                 }
             }
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private func padded(_ cells: [String]) -> [String] {
@@ -244,14 +303,27 @@ private struct MarkdownTableView: View {
         }
     }
 
-    private func backgroundColor(isHeader: Bool, rowIndex: Int) -> Color {
-        if isHeader {
-            return Color.secondary.opacity(context.style == .subdued ? 0.08 : 0.11)
+    private func textAlignment(for alignment: MarkdownTable.Alignment) -> TextAlignment {
+        switch alignment {
+        case .leading:
+            return .leading
+        case .center:
+            return .center
+        case .trailing:
+            return .trailing
         }
+    }
 
-        return rowIndex.isMultiple(of: 2)
-            ? Color.clear
-            : Color.secondary.opacity(context.style == .subdued ? 0.025 : 0.04)
+    private var horizontalRule: some View {
+        Rectangle()
+            .fill(context.tableRuleColor)
+            .frame(height: 1)
+    }
+
+    private var verticalRule: some View {
+        Rectangle()
+            .fill(context.tableRuleColor)
+            .frame(width: 1)
     }
 }
 
@@ -262,30 +334,101 @@ private struct MarkdownRenderContext {
     func headingFont(for level: Int) -> Font {
         switch (style, level) {
         case (.subdued, 1):
-            return .system(size: 20, weight: .semibold)
+            return AppTypography.readingFont(size: 28, weight: .bold)
         case (.subdued, 2):
-            return .system(size: 18, weight: .semibold)
+            return AppTypography.readingFont(size: 24, weight: .semibold)
         case (.subdued, 3):
-            return .system(size: 16, weight: .medium)
+            return AppTypography.readingFont(size: 20, weight: .semibold)
+        case (.subdued, 4):
+            return AppTypography.readingFont(size: 17, weight: .medium)
         case (.subdued, _):
-            return .system(size: 15, weight: .medium)
+            return AppTypography.readingFont(size: 15, weight: .medium)
         case (.standard, 1):
-            return .system(size: 24, weight: .bold)
+            return AppTypography.readingFont(size: 34, weight: .bold)
         case (.standard, 2):
-            return .system(size: 20, weight: .bold)
+            return AppTypography.readingFont(size: 29, weight: .semibold)
         case (.standard, 3):
-            return .system(size: 18, weight: .semibold)
+            return AppTypography.readingFont(size: 24, weight: .semibold)
+        case (.standard, 4):
+            return AppTypography.readingFont(size: 20, weight: .medium)
         case (.standard, _):
-            return .system(size: 16, weight: .semibold)
+            return AppTypography.readingFont(size: 18, weight: .medium)
+        }
+    }
+
+    func headingTracking(for level: Int) -> CGFloat {
+        switch level {
+        case 1:
+            return -0.45
+        case 2:
+            return -0.3
+        case 3:
+            return -0.18
+        default:
+            return -0.05
+        }
+    }
+
+    func headingLineSpacing(for level: Int) -> CGFloat {
+        switch level {
+        case 1:
+            return 4
+        case 2:
+            return 3
+        default:
+            return 2
+        }
+    }
+
+    func headingTopPadding(for level: Int) -> CGFloat {
+        switch level {
+        case 1:
+            return 6
+        case 2:
+            return 4
+        default:
+            return 2
+        }
+    }
+
+    func headingBottomPadding(for level: Int) -> CGFloat {
+        switch level {
+        case 1:
+            return 16
+        case 2:
+            return 12
+        case 3:
+            return 10
+        default:
+            return 8
         }
     }
 
     var bodyFont: Font {
-        .system(size: style == .subdued ? 13 : 14, weight: .regular)
+        AppTypography.readingFont(
+            size: style == .subdued ? AppTypography.subduedBodySize : AppTypography.standardBodySize,
+            weight: AppTypography.bodyWeight
+        )
     }
 
     var tableHeaderFont: Font {
-        .system(size: style == .subdued ? 12 : 13, weight: .semibold)
+        AppTypography.readingFont(size: style == .subdued ? 14 : 16, weight: .semibold)
+    }
+
+    var tableHeaderTracking: CGFloat {
+        style == .subdued ? 0.02 : 0.04
+    }
+
+    var tableHeaderLineSpacing: CGFloat {
+        style == .subdued ? 6 : 7
+    }
+
+    var lineSpacing: CGFloat {
+        style == .subdued ? AppTypography.subduedBodyLineSpacing : AppTypography.standardBodyLineSpacing
+    }
+
+    var bodyTracking: CGFloat {
+        AppTypography.bodyTracking
     }
 
     var primaryForegroundStyle: Color {
@@ -294,6 +437,10 @@ private struct MarkdownRenderContext {
 
     var secondaryForegroundStyle: Color {
         style == .subdued ? Color.secondary.opacity(0.68) : Color.secondary
+    }
+
+    var tableRuleColor: Color {
+        style == .subdued ? Color.secondary.opacity(0.16) : Color.secondary.opacity(0.2)
     }
 }
 

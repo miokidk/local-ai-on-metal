@@ -16,6 +16,8 @@
 		A00100010000000000000007 /* ResponsesAPIClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00200010000000000000007 /* ResponsesAPIClient.swift */; };
 		A00100010000000000000008 /* ChatStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00200010000000000000008 /* ChatStore.swift */; };
 		A00100010000000000000015 /* ModelOutputSanitizer.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00200010000000000000015 /* ModelOutputSanitizer.swift */; };
+		A00100010000000000000016 /* ToolModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00200010000000000000016 /* ToolModels.swift */; };
+		A00100010000000000000017 /* WeatherService.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00200010000000000000017 /* WeatherService.swift */; };
 		A00100010000000000000009 /* ChatRootView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00200010000000000000009 /* ChatRootView.swift */; };
 		A0010001000000000000000A /* ConversationDetailView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A0020001000000000000000A /* ConversationDetailView.swift */; };
 		A0010001000000000000000B /* MessageComposerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A0020001000000000000000B /* MessageComposerView.swift */; };
@@ -39,6 +41,8 @@
 		A00200010000000000000007 /* ResponsesAPIClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResponsesAPIClient.swift; sourceTree = "<group>"; };
 		A00200010000000000000008 /* ChatStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatStore.swift; sourceTree = "<group>"; };
 		A00200010000000000000015 /* ModelOutputSanitizer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelOutputSanitizer.swift; sourceTree = "<group>"; };
+		A00200010000000000000016 /* ToolModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ToolModels.swift; sourceTree = "<group>"; };
+		A00200010000000000000017 /* WeatherService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WeatherService.swift; sourceTree = "<group>"; };
 		A00200010000000000000009 /* ChatRootView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatRootView.swift; sourceTree = "<group>"; };
 		A0020001000000000000000A /* ConversationDetailView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConversationDetailView.swift; sourceTree = "<group>"; };
 		A0020001000000000000000B /* MessageComposerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MessageComposerView.swift; sourceTree = "<group>"; };
@@ -100,6 +104,7 @@
 			children = (
 				A00200010000000000000003 /* ChatModels.swift */,
 				A00200010000000000000004 /* AppSettings.swift */,
+				A00200010000000000000016 /* ToolModels.swift */,
 			);
 			path = Models;
 			sourceTree = "<group>";
@@ -162,6 +167,7 @@
 			isa = PBXGroup;
 			children = (
 				A00200010000000000000008 /* ChatStore.swift */,
+				A00200010000000000000017 /* WeatherService.swift */,
 				A00200010000000000000009 /* ChatRootView.swift */,
 				A0020001000000000000000A /* ConversationDetailView.swift */,
 				A0020001000000000000000B /* MessageComposerView.swift */,
@@ -252,11 +258,13 @@
 				A00100010000000000000002 /* AppCommands.swift in Sources */,
 				A00100010000000000000003 /* ChatModels.swift in Sources */,
 				A00100010000000000000004 /* AppSettings.swift in Sources */,
+				A00100010000000000000016 /* ToolModels.swift in Sources */,
 				A00100010000000000000005 /* ChatPersistence.swift in Sources */,
 				A00100010000000000000006 /* ResponsesPayloadParser.swift in Sources */,
 				A00100010000000000000007 /* ResponsesAPIClient.swift in Sources */,
 				A00100010000000000000008 /* ChatStore.swift in Sources */,
 				A00100010000000000000015 /* ModelOutputSanitizer.swift in Sources */,
+				A00100010000000000000017 /* WeatherService.swift in Sources */,
 				A00100010000000000000009 /* ChatRootView.swift in Sources */,
 				A0010001000000000000000A /* ConversationDetailView.swift in Sources */,
 				A0010001000000000000000B /* MessageComposerView.swift in Sources */,
@@ -288,6 +296,7 @@
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_CFBundleDisplayName = llocust;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.productivity";
+				INFOPLIST_KEY_NSLocationWhenInUseUsageDescription = "llocust uses your location to download a local weather forecast for weather questions.";
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
@@ -318,6 +327,7 @@
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_CFBundleDisplayName = llocust;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.productivity";
+				INFOPLIST_KEY_NSLocationWhenInUseUsageDescription = "llocust uses your location to download a local weather forecast for weather questions.";
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
@@ -341,6 +351,7 @@
 				DEVELOPMENT_TEAM = "";
 				ENABLE_APP_SANDBOX = NO;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_NSLocationWhenInUseUsageDescription = "llocust uses your location to download a local weather forecast for weather questions.";
 				MARKETING_VERSION = 1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = local.llocust;
 				PRODUCT_NAME = llocust;
@@ -357,6 +368,7 @@
 				DEVELOPMENT_TEAM = "";
 				ENABLE_APP_SANDBOX = NO;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_NSLocationWhenInUseUsageDescription = "llocust uses your location to download a local weather forecast for weather questions.";
 				MARKETING_VERSION = 1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = local.llocust;
 				PRODUCT_NAME = llocust;
